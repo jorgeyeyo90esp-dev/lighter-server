@@ -147,11 +147,8 @@ async def historical_load(session, account):
             trades.update(chunk)
             log.info(f"Chunk {i+1}/{len(chunks)} {label}: +{len(chunk)} trades (total {len(trades)})")
         await asyncio.sleep(0.3)
-        text = await export_call(session, account, s, e, 'funding')
-        if text:
-            chunk = parse_funding_csv(text)
-            funding.update(chunk)
-        await asyncio.sleep(0.3)
+    # Load ALL funding via positionFunding API (works for full history)
+    await load_all_funding(session, account)
     wp = sum(1 for t in trades.values() if t.get('pnl') is not None)
     ft = round(sum(f['payment'] for f in funding.values()), 4)
     log.info(f"=== HISTORICAL LOAD DONE: {len(trades)} trades ({wp} with PnL), {len(funding)} funding, funding total={ft} ===")
@@ -169,10 +166,7 @@ async def incremental_update(session, account):
         trades.update(new)
         log.info(f"Incremental trades: +{len(trades)-before} new (total {len(trades)})")
     await asyncio.sleep(0.3)
-    text = await export_call(session, account, ts, now_ms, 'funding')
-    if text:
-        new = parse_funding_csv(text)
-        funding.update(new)
+    await load_all_funding(session, account, start_ts=ts)
     await load_positions(session, account)
     last_incremental = now_ms
     log.info("Incremental done")
@@ -234,6 +228,54 @@ def process_ws_position(p):
         last_update = int(time.time() * 1000)
     except Exception as e:
         log.debug(f"ws_pos: {e}")
+
+async def load_all_funding(session, account, start_ts=None):
+    """Load all funding payments via /api/v1/positionFunding (supports full history)."""
+    now_ms = int(time.time() * 1000)
+    start = start_ts or GENESIS_MS
+    log.info(f"Loading funding from {from_ms(start).strftime('%Y-%m-%d')}...")
+    cursor = None
+    total = 0
+    while True:
+        url = (f"{BASE}/api/v1/positionFunding"
+               f"?account_index={account}&market_id=255&limit=100"
+               f"&start_timestamp={start}&end_timestamp={now_ms}")
+        if cursor:
+            url += f"&cursor={cursor}"
+        try:
+            async with session.get(url, headers=hdrs()) as r:
+                if r.status != 200:
+                    log.warning(f"positionFunding HTTP {r.status}")
+                    break
+                data = await r.json()
+                items = data.get('position_fundings', [])
+                if not items:
+                    break
+                for item in items:
+                    fid = str(item.get('funding_id', ''))
+                    mid = str(item.get('market_id', ''))
+                    payment = float(item.get('change', 0))
+                    ts_val = item.get('timestamp', now_ms)
+                    if fid:
+                        funding[fid] = {
+                            'id': fid,
+                            'symbol': sym(mid),
+                            'side': item.get('position_side', 'long'),
+                            'payment': payment,
+                            'rate': item.get('rate', ''),
+                            'ts': ts_val
+                        }
+                        total += 1
+                cursor = data.get('next_cursor')
+                log.info(f"Funding batch: {total} total")
+                if not cursor or len(items) < 100:
+                    break
+                await asyncio.sleep(0.3)
+        except Exception as e:
+            log.error(f"load_all_funding: {e}")
+            break
+    ft = round(sum(f['payment'] for f in funding.values()), 4)
+    log.info(f"Funding loaded: {total} payments, total={ft} USDC")
 
 async def ws_listener():
     global connected, last_update
