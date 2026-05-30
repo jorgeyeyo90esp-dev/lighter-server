@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: lighter-server
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: LIGHTER_TOKEN
+        sync: false
+      - key: PORT
+        value: 10000
