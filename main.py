@@ -124,7 +124,10 @@ async def export_call(session, account, start_ms, end_ms, etype):
         async with session.get(url, headers=hdrs()) as r:
             if r.status != 200:
                 body = await r.text()
-                log.error(f"export_call {etype} HTTP {r.status}: {body[:200]}")
+                if r.status == 400 and 'no export data' in body:
+                    log.debug(f"export_call {etype}: no data for this period (normal)")
+                else:
+                    log.error(f"export_call {etype} HTTP {r.status}: {body[:200]}")
                 return None
             data = await r.json()
             data_url = data.get('data_url') or data.get('url')
