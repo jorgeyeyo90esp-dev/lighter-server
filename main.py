@@ -647,11 +647,25 @@ async def h_hl_debug(req):
             except Exception as e:
                 results[etype['type']] = str(e)
 
-        # Also try userFundingHistory with different startTime
-        funding_recent = await hl_post(session, {"type": "userFundingHistory", "user": wallet, "startTime": 1748000000000})
-        funding_all = await hl_post(session, {"type": "userFundingHistory", "user": wallet, "startTime": 1700000000000})
-        results['fundingRecent'] = funding_recent
-        results['fundingAll_count'] = len(funding_all) if funding_all else 0
+        # Try all funding endpoints
+        for ftype in [
+            {"type": "userFundingHistory", "user": wallet, "startTime": 1700000000000},
+            {"type": "userFundingHistory", "user": wallet, "startTime": 1748000000000},
+            {"type": "fundingHistory", "coin": "HYPE", "startTime": 1700000000000},
+        ]:
+            try:
+                fd = await hl_post(session, ftype)
+                results[str(ftype)] = {'count': len(fd) if fd else 0, 'first': fd[0] if fd else None}
+            except Exception as e:
+                results[str(ftype)] = str(e)
+
+        # Try portfolio pnlHistory allTime as funding proxy
+        port = await hl_post(session, {"type": "portfolio", "user": wallet})
+        if port:
+            for p in port:
+                if p[0] == 'allTime':
+                    results['portfolio_allTime_pnl_last'] = p[1].get('pnlHistory', [])[-3:]
+                    results['portfolio_allTime_acv_last'] = p[1].get('accountValueHistory', [])[-1]
 
         return cors(web.json_response(results))
 
