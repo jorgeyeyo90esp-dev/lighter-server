@@ -1060,6 +1060,69 @@ async def h_hl_debug(req):
 
         return cors(web.json_response(results))
 
+async def h_aster_upload_csv(req):
+    global aster_trades, aster_funding
+    try:
+        data = await req.json()
+        rows = data.get('rows', [])
+        trades_added = 0
+        funding_added = 0
+        for i, row in enumerate(rows):
+            time_str = row.get('Time', '') or row.get('time', '')
+            rtype = row.get('Type', '') or row.get('type', '')
+            amount_raw = row.get('Amount', '') or row.get('amount', '0')
+            symbol = row.get('Symbol', '') or row.get('symbol', '')
+            # Parse amount - remove currency suffix
+            amount_clean = amount_raw.split(' ')[0] if amount_raw else '0'
+            try:
+                amount = float(amount_clean)
+            except:
+                amount = 0.0
+            # Parse timestamp
+            try:
+                from datetime import datetime, timezone
+                dt = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                ts = int(dt.timestamp() * 1000)
+            except:
+                ts = int(time.time() * 1000)
+            # Clean symbol
+            sym = symbol.replace('USDT','').replace('USDC','').strip()
+            rtype_lower = rtype.lower()
+            if 'pnl' in rtype_lower or 'realizado' in rtype_lower or 'realized' in rtype_lower:
+                tid = f"at_csv_{ts}_{sym}_{i}"
+                aster_trades[tid] = {
+                    'id': tid, 'symbol': sym or '?',
+                    'side': 'long', 'tradeType': 'close',
+                    'price': 0, 'size': 0,
+                    'pnl': amount, 'fee': 0,
+                    'ts': ts, 'source': 'aster_csv'
+                }
+                trades_added += 1
+            elif 'financiamiento' in rtype_lower or 'funding' in rtype_lower:
+                fid = f"af_csv_{ts}_{sym}_{i}"
+                aster_funding[fid] = {
+                    'id': fid, 'symbol': sym or '?',
+                    'payment': amount, 'ts': ts, 'source': 'aster_csv'
+                }
+                funding_added += 1
+        trade_pnl = round(sum(t['pnl'] for t in aster_trades.values() if t.get('pnl')), 4)
+        fund_total = round(sum(f['payment'] for f in aster_funding.values()), 4)
+        aster_load_done = True
+        log.info(f"Aster CSV: +{trades_added} trades, +{funding_added} funding. PnL={trade_pnl}, Funding={fund_total}")
+        return cors(web.json_response({
+            'ok': True, 'trades_added': trades_added,
+            'funding_added': funding_added,
+            'trade_pnl': trade_pnl, 'funding_total': fund_total
+        }))
+    except Exception as e:
+        return cors(web.json_response({'error': str(e)}, status=400))
+
+async def h_aster_clear_csv(req):
+    global aster_trades, aster_funding
+    aster_trades = {k:v for k,v in aster_trades.items() if v.get('source') != 'aster_csv'}
+    aster_funding = {k:v for k,v in aster_funding.items() if v.get('source') != 'aster_csv'}
+    return cors(web.json_response({'ok': True}))
+
 async def h_aster_summary(req):
     return cors(web.json_response(build_aster_summary()))
 
@@ -1144,6 +1207,8 @@ def create_app():
     app.router.add_get('/aster/summary', h_aster_summary)
     app.router.add_get('/aster/trades', h_aster_trades)
     app.router.add_get('/aster/positions', h_aster_positions)
+    app.router.add_post('/aster/upload_csv', h_aster_upload_csv)
+    app.router.add_post('/aster/clear_csv', h_aster_clear_csv)
     app.router.add_get('/hl/debug', h_hl_debug)
     app.router.add_get('/hl/funding_test', h_hl_funding_test)
     app.router.add_get('/hl/ledger', h_hl_ledger_inspect)
