@@ -605,6 +605,17 @@ async def h_summary(req):
         'last_update': last_update
     }))
 
+async def h_hl_debug(req):
+    wallet = HL_WALLET
+    async with ClientSession() as session:
+        data = await hl_post(session, {"type": "clearinghouseState", "user": wallet})
+        funding = await hl_post(session, {"type": "userFundingHistory", "user": wallet, "startTime": 1700000000000})
+        return cors(web.json_response({
+            'clearinghouseState': data,
+            'fundingCount': len(funding) if funding else 0,
+            'fundingFirst': funding[0] if funding else None
+        }))
+
 async def h_hl_summary(req):
     return cors(web.json_response(build_hl_summary()))
 
@@ -663,6 +674,7 @@ def create_app():
     app.router.add_get('/summary', h_summary)
     app.router.add_get('/debug/account', h_account_debug)
     app.router.add_get('/hl/summary', h_hl_summary)
+    app.router.add_get('/hl/debug', h_hl_debug)
     app.router.add_get('/hl/trades', h_hl_trades)
     app.router.add_get('/hl/positions', h_hl_positions)
     app.router.add_options('/{p:.*}', h_options)
