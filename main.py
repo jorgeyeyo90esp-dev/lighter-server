@@ -64,11 +64,10 @@ def from_ms(ms):
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
 
 def today_start_ms():
-    """Start of today in Europe/Madrid timezone."""    try:
+    try:
         import zoneinfo
         tz = zoneinfo.ZoneInfo('Europe/Madrid')
-    except:
-        # UTC+2 fallback (CEST summer)
+    except Exception:
         from datetime import timedelta
         tz = timezone(timedelta(hours=2))
     now_local = datetime.now(tz)
