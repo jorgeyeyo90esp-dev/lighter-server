@@ -29,6 +29,8 @@ TOKEN = os.environ.get('LIGHTER_TOKEN', '')
 HL_WALLET = os.environ.get('HL_WALLET', '')  # Hyperliquid wallet address
 HL_BASE = 'https://api.hyperliquid.xyz/info'
 
+eur_cache = {}  # EUR/USD rate cache
+
 # Aster state
 aster_trades = {}
 aster_funding = {}
@@ -905,15 +907,8 @@ async def h_positions(req):
     return cors(web.json_response({'positions': list(positions.values())}))
 
 async def h_eur_rates(req):
-    """Return cached EUR rates and current rate."""
-    async with ClientSession() as session:
-        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-        rate = await get_usd_eur_rate(session, int(time.time()*1000))
-    return cors(web.json_response({
-        'current_rate': rate,
-        'cached_dates': len(eur_cache),
-        'today': today
-    }))
+    """EUR rates endpoint - pending implementation."""
+    return cors(web.json_response({'current_rate': None, 'cached_dates': 0, 'note': 'EUR conversion coming soon'}))
 
 async def h_summary(req):
     ts = today_start_ms()
