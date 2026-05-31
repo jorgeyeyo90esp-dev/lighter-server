@@ -123,17 +123,21 @@ async def export_call(session, account, start_ms, end_ms, etype):
     try:
         async with session.get(url, headers=hdrs()) as r:
             if r.status != 200:
+                body = await r.text()
+                log.error(f"export_call {etype} HTTP {r.status}: {body[:200]}")
                 return None
             data = await r.json()
             data_url = data.get('data_url') or data.get('url')
             if not data_url:
+                log.error(f"export_call {etype}: no data_url in response: {str(data)[:200]}")
                 return None
         async with session.get(data_url) as r:
             if r.status != 200:
+                log.error(f"export_call {etype} data_url HTTP {r.status}")
                 return None
             return await r.text()
     except Exception as e:
-        log.debug(f"export_call {etype}: {e}")
+        log.error(f"export_call {etype}: {e}")
         return None
 
 async def load_all_funding(session, account, start_ts=None):
