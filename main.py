@@ -393,6 +393,16 @@ async def h_summary(req):
         'last_update': last_update
     }))
 
+async def h_account_debug(req):
+    account = get_account()
+    try:
+        async with ClientSession() as s:
+            async with s.get(f"{BASE}/api/v1/account?by=index&value={account}", headers=hdrs()) as r:
+                data = await r.json()
+                return cors(web.json_response({'raw': data}))
+    except Exception as e:
+        return cors(web.json_response({'error': str(e)}))
+
 async def h_options(req):
     return web.Response(headers={
         'Access-Control-Allow-Origin': '*',
@@ -416,6 +426,7 @@ def create_app():
     app.router.add_get('/funding', h_funding)
     app.router.add_get('/positions', h_positions)
     app.router.add_get('/summary', h_summary)
+    app.router.add_get('/debug/account', h_account_debug)
     app.router.add_options('/{p:.*}', h_options)
     app.on_startup.append(on_start)
     app.on_cleanup.append(on_stop)
