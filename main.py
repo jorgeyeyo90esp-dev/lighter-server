@@ -329,24 +329,32 @@ async def load_hl_data():
                 }
             log.info(f"HL fills: {len(hl_trades)}")
 
-        # 2. Funding history
-        data = await hl_post(session, {"type": "userFundingHistory",
-                                        "user": HL_WALLET,
-                                        "startTime": 1700000000000})
-        if data and isinstance(data, list):
-            for i, f in enumerate(data):
-                delta = f.get('delta', {})
-                fid = f"hl_f_{i}_{f.get('time','')}"
-                payment = float(delta.get('usdc', 0))
-                coin = delta.get('coin', '?')
-                hl_funding[fid] = {
-                    'id': fid,
-                    'symbol': coin,
-                    'payment': payment,
-                    'ts': int(f.get('time', 0)),
-                    'source': 'hl'
-                }
-            log.info(f"HL funding: {len(hl_funding)} payments")
+        # 2. Funding history - try standard perps and HIP-3 dexes
+        funding_idx = 0
+        for dex_name in ['', 'xyz']:  # '' = standard perps, 'xyz' = HIP-3 markets
+            payload = {"type": "userFundingHistory", "user": HL_WALLET, "startTime": 1700000000000}
+            if dex_name:
+                payload["dex"] = dex_name
+            data = await hl_post(session, payload)
+            if data and isinstance(data, list):
+                for f in data:
+                    delta = f.get('delta', {})
+                    ts = int(f.get('time', 0))
+                    fid = f"hl_f_{dex_name}_{ts}_{funding_idx}"
+                    funding_idx += 1
+                    payment = float(delta.get('usdc', 0))
+                    coin = delta.get('coin', '?')
+                    if dex_name and not coin.startswith(dex_name+':'):
+                        coin = f"{dex_name}:{coin}"
+                    hl_funding[fid] = {
+                        'id': fid,
+                        'symbol': coin,
+                        'payment': payment,
+                        'ts': ts,
+                        'source': 'hl'
+                    }
+                log.info(f"HL funding dex='{dex_name}': {len(data)} payments")
+        log.info(f"HL funding total: {len(hl_funding)} payments")
 
         # 3. Current positions + account value from portfolio + spot balance
         data = await hl_post(session, {"type": "clearinghouseState", "user": HL_WALLET})
@@ -397,11 +405,30 @@ async def load_hl_data():
         log.info(f"HL DONE: {len(hl_trades)} fills ({wp} with PnL), funding={ft}")
 
 async def hl_incremental():
-    global hl_trades, hl_positions, hl_account_value, hl_last_update
+    global hl_trades, hl_positions, hl_account_value, hl_funding, hl_last_update
     if not HL_WALLET or not hl_load_done:
         return
     log.info("HL incremental update...")
     async with ClientSession() as session:
+        # Refresh funding for both dexes
+        funding_idx = len(hl_funding)
+        for dex_name in ['', 'xyz']:
+            payload = {"type": "userFundingHistory", "user": HL_WALLET, "startTime": today_start_ms()}
+            if dex_name:
+                payload["dex"] = dex_name
+            data = await hl_post(session, payload)
+            if data and isinstance(data, list):
+                for f in data:
+                    delta = f.get('delta', {})
+                    ts = int(f.get('time', 0))
+                    fid = f"hl_f_{dex_name}_{ts}_{funding_idx}"
+                    funding_idx += 1
+                    payment = float(delta.get('usdc', 0))
+                    coin = delta.get('coin', '?')
+                    if dex_name and not coin.startswith(dex_name+':'):
+                        coin = f"{dex_name}:{coin}"
+                    hl_funding[fid] = {'id': fid, 'symbol': coin, 'payment': payment, 'ts': ts, 'source': 'hl'}
+        log.info(f"HL funding after incremental: {len(hl_funding)}")
         # Get latest fills
         data = await hl_post(session, {"type": "userFills", "user": HL_WALLET})
         if data and isinstance(data, list):
