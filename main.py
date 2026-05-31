@@ -329,32 +329,8 @@ async def load_hl_data():
                 }
             log.info(f"HL fills: {len(hl_trades)}")
 
-        # 2. Funding history - try standard perps and HIP-3 dexes
-        funding_idx = 0
-        for dex_name in ['', 'xyz']:  # '' = standard perps, 'xyz' = HIP-3 markets
-            payload = {"type": "userFundingHistory", "user": HL_WALLET, "startTime": 1700000000000}
-            if dex_name:
-                payload["dex"] = dex_name
-            data = await hl_post(session, payload)
-            if data and isinstance(data, list):
-                for f in data:
-                    delta = f.get('delta', {})
-                    ts = int(f.get('time', 0))
-                    fid = f"hl_f_{dex_name}_{ts}_{funding_idx}"
-                    funding_idx += 1
-                    payment = float(delta.get('usdc', 0))
-                    coin = delta.get('coin', '?')
-                    if dex_name and not coin.startswith(dex_name+':'):
-                        coin = f"{dex_name}:{coin}"
-                    hl_funding[fid] = {
-                        'id': fid,
-                        'symbol': coin,
-                        'payment': payment,
-                        'ts': ts,
-                        'source': 'hl'
-                    }
-                log.info(f"HL funding dex='{dex_name}': {len(data)} payments")
-        log.info(f"HL funding total: {len(hl_funding)} payments")
+        # 2. Funding — loaded via CSV upload endpoint (see /hl/upload_funding)
+        log.info(f"HL funding: {len(hl_funding)} payments (loaded from CSV uploads)")
 
         # 3. Current positions + account value from portfolio + spot balance
         data = await hl_post(session, {"type": "clearinghouseState", "user": HL_WALLET})
@@ -410,25 +386,7 @@ async def hl_incremental():
         return
     log.info("HL incremental update...")
     async with ClientSession() as session:
-        # Refresh funding for both dexes
-        funding_idx = len(hl_funding)
-        for dex_name in ['', 'xyz']:
-            payload = {"type": "userFundingHistory", "user": HL_WALLET, "startTime": today_start_ms()}
-            if dex_name:
-                payload["dex"] = dex_name
-            data = await hl_post(session, payload)
-            if data and isinstance(data, list):
-                for f in data:
-                    delta = f.get('delta', {})
-                    ts = int(f.get('time', 0))
-                    fid = f"hl_f_{dex_name}_{ts}_{funding_idx}"
-                    funding_idx += 1
-                    payment = float(delta.get('usdc', 0))
-                    coin = delta.get('coin', '?')
-                    if dex_name and not coin.startswith(dex_name+':'):
-                        coin = f"{dex_name}:{coin}"
-                    hl_funding[fid] = {'id': fid, 'symbol': coin, 'payment': payment, 'ts': ts, 'source': 'hl'}
-        log.info(f"HL funding after incremental: {len(hl_funding)}")
+        log.info(f"HL incremental: funding unchanged ({len(hl_funding)} from CSV)")
         # Get latest fills
         data = await hl_post(session, {"type": "userFills", "user": HL_WALLET})
         if data and isinstance(data, list):
@@ -657,6 +615,95 @@ async def h_summary(req):
         'last_update': last_update
     }))
 
+async def h_hl_upload_funding(req):
+    """Accept CSV funding data uploaded from frontend."""
+    global hl_funding
+    try:
+        data = await req.json()
+        rows = data.get('rows', [])
+        added = 0
+        for i, row in enumerate(rows):
+            # Expected fields: time/hora, coin/moneda, amount/pago, rate/tasa, side, size
+            ts_raw = row.get('time') or row.get('hora') or row.get('Time') or row.get('Hora') or ''
+            coin = row.get('coin') or row.get('moneda') or row.get('Coin') or row.get('Moneda') or '?'
+            payment_raw = row.get('amount') or row.get('pago') or row.get('Amount') or row.get('Pago') or row.get('payment') or '0'
+            # Parse timestamp
+            try:
+                if isinstance(ts_raw, (int, float)):
+                    ts = int(ts_raw)
+                else:
+                    from datetime import datetime, timezone
+                    ts_str = str(ts_raw).replace('/', '-')
+                    dt = datetime.fromisoformat(ts_str.replace(' ', 'T'))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    ts = int(dt.timestamp() * 1000)
+            except:
+                ts = int(time.time() * 1000)
+            payment = float(str(payment_raw).replace(',', '.').replace(' USDC', '') or 0)
+            fid = f"hl_csv_{ts}_{coin}_{i}"
+            hl_funding[fid] = {
+                'id': fid,
+                'symbol': coin,
+                'payment': payment,
+                'ts': ts,
+                'source': 'hl_csv'
+            }
+            added += 1
+        total = round(sum(f['payment'] for f in hl_funding.values()), 4)
+        log.info(f"HL funding CSV upload: +{added} rows, total={total}")
+        return cors(web.json_response({'ok': True, 'added': added, 'total_funding': total, 'total_rows': len(hl_funding)}))
+    except Exception as e:
+        return cors(web.json_response({'error': str(e)}, status=400))
+
+async def h_hl_clear_funding(req):
+    """Clear all CSV-uploaded funding data."""
+    global hl_funding
+    hl_funding = {k: v for k, v in hl_funding.items() if v.get('source') != 'hl_csv'}
+    return cors(web.json_response({'ok': True, 'remaining': len(hl_funding)}))
+
+async def h_hl_funding_test(req):
+    """Test all possible funding endpoints with pagination."""
+    wallet = HL_WALLET
+    results = {}
+    async with ClientSession() as session:
+        # Test every dex name variant
+        for dex in ['', 'xyz', 'XYZ', 'hip3', 'HIP3']:
+            payload = {"type": "userFundingHistory", "user": wallet, "startTime": 1700000000000}
+            if dex:
+                payload["dex"] = dex
+            data = await hl_post(session, payload)
+            key = f"dex_{dex or 'none'}"
+            results[key] = {
+                'count': len(data) if data and isinstance(data, list) else 0,
+                'first': data[0] if data and isinstance(data, list) and len(data) > 0 else None,
+                'raw_type': type(data).__name__,
+                'raw_preview': str(data)[:200] if data else None
+            }
+
+        # Also try userNonFundingLedgerUpdates
+        for type_name in ['userNonFundingLedgerUpdates', 'userRateLimit']:
+            try:
+                data = await hl_post(session, {"type": type_name, "user": wallet, "startTime": 1700000000000})
+                results[type_name] = {
+                    'count': len(data) if isinstance(data, list) else 'not_list',
+                    'first': data[0] if isinstance(data, list) and data else None
+                }
+            except Exception as e:
+                results[type_name] = str(e)
+
+        # Try clearinghouseState with dex=xyz
+        try:
+            data = await hl_post(session, {"type": "clearinghouseState", "user": wallet, "dex": "xyz"})
+            results['clearinghouseState_xyz'] = {
+                'marginSummary': data.get('marginSummary') if data else None,
+                'positions_count': len(data.get('assetPositions', [])) if data else 0
+            }
+        except Exception as e:
+            results['clearinghouseState_xyz'] = str(e)
+
+    return cors(web.json_response(results))
+
 async def h_hl_debug(req):
     wallet = HL_WALLET
     async with ClientSession() as session:
@@ -755,6 +802,9 @@ def create_app():
     app.router.add_get('/debug/account', h_account_debug)
     app.router.add_get('/hl/summary', h_hl_summary)
     app.router.add_get('/hl/debug', h_hl_debug)
+    app.router.add_get('/hl/funding_test', h_hl_funding_test)
+    app.router.add_post('/hl/upload_funding', h_hl_upload_funding)
+    app.router.add_post('/hl/clear_funding', h_hl_clear_funding)
     app.router.add_get('/hl/trades', h_hl_trades)
     app.router.add_get('/hl/positions', h_hl_positions)
     app.router.add_options('/{p:.*}', h_options)
