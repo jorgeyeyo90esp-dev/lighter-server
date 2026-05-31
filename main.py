@@ -608,13 +608,27 @@ async def h_summary(req):
 async def h_hl_debug(req):
     wallet = HL_WALLET
     async with ClientSession() as session:
-        data = await hl_post(session, {"type": "clearinghouseState", "user": wallet})
-        funding = await hl_post(session, {"type": "userFundingHistory", "user": wallet, "startTime": 1700000000000})
-        return cors(web.json_response({
-            'clearinghouseState': data,
-            'fundingCount': len(funding) if funding else 0,
-            'fundingFirst': funding[0] if funding else None
-        }))
+        results = {}
+        # Try multiple endpoints to find balance
+        for etype in [
+            {"type": "clearinghouseState", "user": wallet},
+            {"type": "spotClearinghouseState", "user": wallet},
+            {"type": "portfolio", "user": wallet},
+            {"type": "userState", "user": wallet},
+        ]:
+            try:
+                data = await hl_post(session, etype)
+                results[etype['type']] = data
+            except Exception as e:
+                results[etype['type']] = str(e)
+
+        # Also try userFundingHistory with different startTime
+        funding_recent = await hl_post(session, {"type": "userFundingHistory", "user": wallet, "startTime": 1748000000000})
+        funding_all = await hl_post(session, {"type": "userFundingHistory", "user": wallet, "startTime": 1700000000000})
+        results['fundingRecent'] = funding_recent
+        results['fundingAll_count'] = len(funding_all) if funding_all else 0
+
+        return cors(web.json_response(results))
 
 async def h_hl_summary(req):
     return cors(web.json_response(build_hl_summary()))
