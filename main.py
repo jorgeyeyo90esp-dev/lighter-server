@@ -8,10 +8,6 @@ import logging
 from datetime import datetime, timezone, timedelta
 from aiohttp import web, ClientSession, WSMsgType
 
-import io as _io
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
@@ -28,8 +24,6 @@ last_incremental = 0
 TOKEN = os.environ.get('LIGHTER_TOKEN', '')
 HL_WALLET = os.environ.get('HL_WALLET', '')  # Hyperliquid wallet address
 HL_BASE = 'https://api.hyperliquid.xyz/info'
-
-eur_cache = {}  # EUR/USD rate cache
 
 # Aster state
 aster_trades = {}
@@ -370,32 +364,6 @@ async def load_aster_income(session, income_type, start_ms):
         cursor = end + 1
         await asyncio.sleep(1.0)  # Be respectful with rate limits
     return results
-
-async def prefetch_eur_rates():
-    """Pre-fetch EUR rates for all dates we have trades on."""
-    all_ts = (
-        [int(t.get('ts',0)) for t in trades.values() if t.get('ts')] +
-        [int(t.get('ts',0)) for t in hl_trades.values() if t.get('ts')] +
-        [int(t.get('ts',0)) for t in aster_trades.values() if t.get('ts')]
-    )
-    dates = set(datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime('%Y-%m-%d') for ts in all_ts if ts)
-    uncached = [d for d in dates if d not in eur_cache]
-    if not uncached:
-        return
-    log.info(f"Fetching EUR rates for {len(uncached)} dates...")
-    async with ClientSession() as session:
-        for date_str in sorted(uncached):
-            try:
-                url = f"https://api.frankfurter.app/{date_str}?from=USD&to=EUR"
-                async with session.get(url) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        rate = data.get('rates', {}).get('EUR')
-                        if rate:
-                            eur_cache[date_str] = float(rate)
-                await asyncio.sleep(0.1)
-            except: pass
-    log.info(f"EUR rates cached: {len(eur_cache)} dates")
 
 async def load_aster_data():
     global aster_trades, aster_funding, aster_positions, aster_account_value
@@ -906,10 +874,6 @@ async def h_funding(req):
 async def h_positions(req):
     return cors(web.json_response({'positions': list(positions.values())}))
 
-async def h_eur_rates(req):
-    """EUR rates endpoint - pending implementation."""
-    return cors(web.json_response({'current_rate': None, 'cached_dates': 0, 'note': 'EUR conversion coming soon'}))
-
 async def h_summary(req):
     ts = today_start_ms()
     closes = [t for t in trades.values() if t.get('tradeType') == 'close' and t.get('pnl') is not None]
@@ -1191,313 +1155,6 @@ async def h_account_debug(req):
     except Exception as e:
         return cors(web.json_response({'error': str(e)}))
 
-async def h_export_excel(req):
-    """Generate Excel with all trading data across all exchanges."""
-    try:
-        import io as _io
-        from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-        from openpyxl.utils import get_column_letter
-
-        wb = Workbook()
-        wb.remove(wb.active)
-
-        # Styles
-        hdr_font = Font(bold=True, color='FFFFFF', size=11)
-        hdr_fill_lt = PatternFill('solid', fgColor='1a1a18')
-        hdr_fill_hl = PatternFill('solid', fgColor='1D9E75')
-        hdr_fill_at = PatternFill('solid', fgColor='A0522D')
-        hdr_fill_gl = PatternFill('solid', fgColor='2C3E50')
-        hdr_fill_sub = PatternFill('solid', fgColor='4A4A48')
-        pos_fill = PatternFill('solid', fgColor='E8F5E9')
-        neg_fill = PatternFill('solid', fgColor='FFEBEE')
-        pos_font = Font(color='1B5E20', bold=True)
-        neg_font = Font(color='B71C1C', bold=True)
-        thin = Border(
-            left=Side(style='thin', color='CCCCCC'),
-            right=Side(style='thin', color='CCCCCC'),
-            top=Side(style='thin', color='CCCCCC'),
-            bottom=Side(style='thin', color='CCCCCC')
-        )
-        center = Alignment(horizontal='center', vertical='center')
-        left = Alignment(horizontal='left', vertical='center')
-
-        def style_header_row(ws, row_num, headers, fill):
-            for col, h in enumerate(headers, 1):
-                cell = ws.cell(row_num, col, h)
-                cell.font = hdr_font; cell.fill = fill
-                cell.alignment = center; cell.border = thin
-
-        def set_col_widths(ws, widths):
-            for i, w in enumerate(widths, 1):
-                ws.column_dimensions[get_column_letter(i)].width = w
-
-        def style_pnl_cell(cell, val):
-            if val is None or val == '': return
-            try:
-                v = float(str(val).replace('%','').replace('+',''))
-                if v > 0: cell.font = pos_font; cell.fill = pos_fill
-                elif v < 0: cell.font = neg_font; cell.fill = neg_fill
-            except: pass
-
-        def fmt_ts(ts):
-            if not ts: return ''
-            try: return datetime.fromtimestamp(int(ts)/1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')
-            except: return str(ts)
-
-        def fmt_date(ts):
-            if not ts: return ''
-            try: return datetime.fromtimestamp(int(ts)/1000, tz=timezone.utc).strftime('%Y-%m-%d')
-            except: return str(ts)
-
-        def write_summary_block(ws, title, rows, fill, start_row=1):
-            # Title
-            tc = ws.cell(start_row, 1, title)
-            tc.font = Font(bold=True, color='FFFFFF', size=13)
-            tc.fill = fill; tc.alignment = left
-            ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=3)
-            r = start_row + 1
-            for key, val in rows:
-                ws.cell(r, 1, key).font = Font(bold=True)
-                vc = ws.cell(r, 2, val)
-                style_pnl_cell(vc, val)
-                r += 1
-            return r + 1
-
-        def build_daily_map(trade_list):
-            dm = {}
-            for t in trade_list:
-                if t.get('pnl') is None: continue
-                k = fmt_date(t.get('ts',''))
-                if k: dm[k] = dm.get(k, 0) + t['pnl']
-            return dm
-
-        # ── Prepare data ──
-        lt_closes = [t for t in trades.values() if t.get('tradeType')=='close' and t.get('pnl') is not None]
-        lt_pnl = sum(t['pnl'] for t in lt_closes)
-        lt_fund = sum(f['payment'] for f in funding.values())
-        lt_wins = sum(1 for t in lt_closes if t['pnl']>0)
-        lt_wr = round(lt_wins/len(lt_closes)*100,1) if lt_closes else 0
-        lt_bal = account_balance.get('value') or 0
-
-        hl_closes = [t for t in hl_trades.values() if t.get('tradeType')=='close' and t.get('pnl') is not None]
-        hl_pnl = sum(t['pnl'] for t in hl_closes)
-        hl_fund = sum(f['payment'] for f in hl_funding.values())
-        hl_wins = sum(1 for t in hl_closes if t['pnl']>0)
-        hl_wr = round(hl_wins/len(hl_closes)*100,1) if hl_closes else 0
-        hl_bal = hl_account_value or 0
-
-        at_closes = [t for t in aster_trades.values() if t.get('pnl') is not None]
-        at_pnl = sum(t['pnl'] for t in at_closes)
-        at_fund = sum(f['payment'] for f in aster_funding.values())
-        at_wins = sum(1 for t in at_closes if t['pnl']>0)
-        at_wr = round(at_wins/len(at_closes)*100,1) if at_closes else 0
-        at_bal = aster_account_value or 0
-
-        total_pnl = lt_pnl + hl_pnl + at_pnl
-        total_fund = lt_fund + hl_fund + at_fund
-        total_bal = lt_bal + hl_bal + at_bal
-        all_closes_n = len(lt_closes) + len(hl_closes) + len(at_closes)
-        all_wins_n = lt_wins + hl_wins + at_wins
-        global_wr = round(all_wins_n/all_closes_n*100,1) if all_closes_n else 0
-        pct_rent = round((total_pnl+total_fund)/total_bal*100,2) if total_bal else 0
-
-        # ══════════════════════════════════════════
-        # HOJA GLOBAL (primera)
-        # ══════════════════════════════════════════
-        ws_gl = wb.create_sheet('Global', 0)
-
-        # Title block
-        ws_gl.row_dimensions[1].height = 30
-        t1 = ws_gl.cell(1, 1, 'REGISTRO DE OPERACIONES DEX')
-        t1.font = Font(bold=True, size=16, color='FFFFFF')
-        t1.fill = hdr_fill_gl; t1.alignment = center
-        ws_gl.merge_cells('A1:E1')
-        ws_gl.cell(2, 1, f"Generado: {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M UTC')}").font = Font(italic=True, color='888888')
-        ws_gl.merge_cells('A2:E2')
-
-        # Resumen por exchange
-        ws_gl.cell(4, 1, 'RESUMEN POR EXCHANGE').font = Font(bold=True, size=13, color='FFFFFF')
-        ws_gl.cell(4, 1).fill = hdr_fill_gl
-        ws_gl.merge_cells('A4:E4')
-        style_header_row(ws_gl, 5, ['', 'Lighter', 'Hyperliquid', 'Aster', 'TOTAL'], hdr_fill_sub)
-        summary_data = [
-            ('P&L Trades (USDC)', round(lt_pnl,4), round(hl_pnl,4), round(at_pnl,4), round(total_pnl,4)),
-            ('Funding (USDC)',    round(lt_fund,4), round(hl_fund,4), round(at_fund,4), round(total_fund,4)),
-            ('P&L Total (USDC)', round(lt_pnl+lt_fund,4), round(hl_pnl+hl_fund,4), round(at_pnl+at_fund,4), round(total_pnl+total_fund,4)),
-            ('Capital (USDC)',    round(lt_bal,2), round(hl_bal,2), round(at_bal,2), round(total_bal,2)),
-            ('% Rentabilidad',   f"{round((lt_pnl+lt_fund)/lt_bal*100,2) if lt_bal else 0}%", f"{round((hl_pnl+hl_fund)/hl_bal*100,2) if hl_bal else 0}%", f"{round((at_pnl+at_fund)/at_bal*100,2) if at_bal else 0}%", f"{pct_rent}%"),
-            ('Trades Cerrados',  len(lt_closes), len(hl_closes), len(at_closes), all_closes_n),
-            ('Wins / Losses',    f"{lt_wins}/{len(lt_closes)-lt_wins}", f"{hl_wins}/{len(hl_closes)-hl_wins}", f"{at_wins}/{len(at_closes)-at_wins}", f"{all_wins_n}/{all_closes_n-all_wins_n}"),
-            ('Win Rate',         f"{lt_wr}%", f"{hl_wr}%", f"{at_wr}%", f"{global_wr}%"),
-        ]
-        for i, row in enumerate(summary_data, 6):
-            ws_gl.cell(i, 1, row[0]).font = Font(bold=True)
-            for j, val in enumerate(row[1:], 2):
-                cell = ws_gl.cell(i, j, val)
-                cell.alignment = center; cell.border = thin
-                style_pnl_cell(cell, val)
-
-        # Diario combinado
-        r = len(summary_data) + 8
-        ws_gl.cell(r, 1, 'DIARIO COMBINADO').font = Font(bold=True, size=13, color='FFFFFF')
-        ws_gl.cell(r, 1).fill = hdr_fill_gl
-        ws_gl.merge_cells(start_row=r, start_column=1, end_row=r, end_column=7)
-        r += 1
-        daily_headers = ['Fecha', 'P&L Lighter', 'P&L Hyperliquid', 'P&L Aster', 'P&L Total Día', '% Total', 'Acumulado']
-        style_header_row(ws_gl, r, daily_headers, hdr_fill_sub)
-        r += 1
-        dm_lt = build_daily_map(lt_closes)
-        dm_hl = build_daily_map(hl_closes)
-        dm_at = build_daily_map(at_closes)
-        all_dates = sorted(set(list(dm_lt.keys())+list(dm_hl.keys())+list(dm_at.keys())), reverse=True)
-        all_total_pnl_sum = total_pnl + total_fund
-        cum = all_total_pnl_sum
-        for d in all_dates:
-            l = round(dm_lt.get(d,0),4); h = round(dm_hl.get(d,0),4)
-            a = round(dm_at.get(d,0),4); tot = round(l+h+a,4)
-            pct = round(tot/abs(all_total_pnl_sum)*100,1) if all_total_pnl_sum else 0
-            ws_gl.cell(r,1,d); ws_gl.cell(r,1).alignment = center
-            for col, val in [(2,l),(3,h),(4,a),(5,tot),(6,f"{pct}%"),(7,round(cum,4))]:
-                cell = ws_gl.cell(r, col, val)
-                cell.alignment = center; cell.border = thin
-                style_pnl_cell(cell, val)
-            cum -= tot; r += 1
-
-        set_col_widths(ws_gl, [20, 16, 16, 16, 16, 12, 16])
-
-        # ══════════════════════════════════════════
-        # HOJA LIGHTER
-        # ══════════════════════════════════════════
-        ws_lt = wb.create_sheet('Lighter')
-        ws_lt.cell(1,1,'LIGHTER').font = Font(bold=True,size=14,color='FFFFFF')
-        ws_lt.cell(1,1).fill = hdr_fill_lt
-        ws_lt.merge_cells('A1:H1')
-        lt_sum_rows = [
-            ('P&L Trades', round(lt_pnl,4)), ('Funding Total', round(lt_fund,4)),
-            ('P&L Total', round(lt_pnl+lt_fund,4)), ('Capital Cuenta', round(lt_bal,2)),
-            ('% Rentabilidad', f"{round((lt_pnl+lt_fund)/lt_bal*100,2) if lt_bal else 0}%"),
-            ('Trades Cerrados', len(lt_closes)), ('Win Rate', f"{lt_wr}%"),
-        ]
-        for i,(k,v) in enumerate(lt_sum_rows, 2):
-            ws_lt.cell(i,1,k).font = Font(bold=True)
-            vc = ws_lt.cell(i,2,v); vc.border = thin; style_pnl_cell(vc,v)
-        r = len(lt_sum_rows) + 4
-        ws_lt.cell(r,1,'HISTORIAL DE TRADES').font = Font(bold=True,size=12,color='FFFFFF')
-        ws_lt.cell(r,1).fill = hdr_fill_lt; ws_lt.merge_cells(start_row=r,start_column=1,end_row=r,end_column=8); r+=1
-        lt_t_hdrs = ['Fecha','Mercado','Tipo','Lado','Precio','Tamaño','P&L (USDC)','Fee']
-        style_header_row(ws_lt, r, lt_t_hdrs, hdr_fill_lt); r+=1
-        for t in sorted(trades.values(), key=lambda t: int(t.get('ts',0) or 0), reverse=True):
-            row_data = [fmt_ts(t.get('ts')), t.get('symbol',''),
-                'Cierre' if t.get('tradeType')=='close' else 'Apertura',
-                (t.get('side','') or '').upper(),
-                round(float(t.get('price') or 0),4) or '',
-                round(float(t.get('size') or 0),6) or '',
-                t.get('pnl') if t.get('pnl') is not None else '',
-                round(float(t.get('fee') or 0),6) or '']
-            for col,val in enumerate(row_data,1):
-                cell=ws_lt.cell(r,col,val); cell.border=thin
-                if col==1: cell.alignment=center
-            style_pnl_cell(ws_lt.cell(r,7), row_data[6]); r+=1
-        r+=1
-        ws_lt.cell(r,1,'FUNDING FEES').font = Font(bold=True,size=12,color='FFFFFF')
-        ws_lt.cell(r,1).fill = hdr_fill_lt; ws_lt.merge_cells(start_row=r,start_column=1,end_row=r,end_column=5); r+=1
-        style_header_row(ws_lt, r, ['Fecha','Mercado','Lado','Pago (USDC)','Tasa'], hdr_fill_lt); r+=1
-        for f in sorted(funding.values(), key=lambda f: int(f.get('ts',0) or 0), reverse=True):
-            row_data=[fmt_ts(f.get('ts')),f.get('symbol',''),f.get('side',''),f.get('payment',''),f.get('rate','')]
-            for col,val in enumerate(row_data,1):
-                cell=ws_lt.cell(r,col,val); cell.border=thin
-            style_pnl_cell(ws_lt.cell(r,4), f.get('payment')); r+=1
-        set_col_widths(ws_lt,[18,12,10,8,14,14,16,14])
-
-        # ══════════════════════════════════════════
-        # HOJA HYPERLIQUID
-        # ══════════════════════════════════════════
-        ws_hl = wb.create_sheet('Hyperliquid')
-        ws_hl.cell(1,1,'HYPERLIQUID').font = Font(bold=True,size=14,color='FFFFFF')
-        ws_hl.cell(1,1).fill = hdr_fill_hl; ws_hl.merge_cells('A1:H1')
-        hl_sum_rows = [
-            ('P&L Trades', round(hl_pnl,4)), ('Funding Total', round(hl_fund,4)),
-            ('P&L Total', round(hl_pnl+hl_fund,4)), ('Capital Cuenta', round(hl_bal,2)),
-            ('% Rentabilidad', f"{round((hl_pnl+hl_fund)/hl_bal*100,2) if hl_bal else 0}%"),
-            ('Trades Cerrados', len(hl_closes)), ('Win Rate', f"{hl_wr}%"),
-        ]
-        for i,(k,v) in enumerate(hl_sum_rows,2):
-            ws_hl.cell(i,1,k).font=Font(bold=True)
-            vc=ws_hl.cell(i,2,v); vc.border=thin; style_pnl_cell(vc,v)
-        r=len(hl_sum_rows)+4
-        ws_hl.cell(r,1,'HISTORIAL DE TRADES').font=Font(bold=True,size=12,color='FFFFFF')
-        ws_hl.cell(r,1).fill=hdr_fill_hl; ws_hl.merge_cells(start_row=r,start_column=1,end_row=r,end_column=8); r+=1
-        style_header_row(ws_hl,r,['Fecha','Mercado','Tipo','Lado','Precio','Tamaño','P&L (USDC)','Fee'],hdr_fill_hl); r+=1
-        for t in sorted(hl_trades.values(), key=lambda t: int(t.get('ts',0) or 0), reverse=True):
-            row_data=[fmt_ts(t.get('ts')),t.get('symbol',''),'Cierre' if t.get('tradeType')=='close' else 'Apertura',(t.get('side','') or '').upper(),round(float(t.get('price') or 0),4) or '',round(float(t.get('size') or 0),6) or '',t.get('pnl') if t.get('pnl') is not None else '',round(float(t.get('fee') or 0),6) or '']
-            for col,val in enumerate(row_data,1):
-                cell=ws_hl.cell(r,col,val); cell.border=thin
-                if col==1: cell.alignment=center
-            style_pnl_cell(ws_hl.cell(r,7),row_data[6]); r+=1
-        r+=1
-        ws_hl.cell(r,1,'FUNDING FEES').font=Font(bold=True,size=12,color='FFFFFF')
-        ws_hl.cell(r,1).fill=hdr_fill_hl; ws_hl.merge_cells(start_row=r,start_column=1,end_row=r,end_column=3); r+=1
-        style_header_row(ws_hl,r,['Fecha','Mercado','Pago (USDC)'],hdr_fill_hl); r+=1
-        for f in sorted(hl_funding.values(), key=lambda f: int(f.get('ts',0) or 0), reverse=True):
-            row_data=[fmt_ts(f.get('ts')),f.get('symbol',''),f.get('payment','')]
-            for col,val in enumerate(row_data,1):
-                cell=ws_hl.cell(r,col,val); cell.border=thin
-            style_pnl_cell(ws_hl.cell(r,3),f.get('payment')); r+=1
-        set_col_widths(ws_hl,[18,12,10,8,14,14,16,14])
-
-        # ══════════════════════════════════════════
-        # HOJA ASTER
-        # ══════════════════════════════════════════
-        ws_at = wb.create_sheet('Aster')
-        ws_at.cell(1,1,'ASTER').font=Font(bold=True,size=14,color='FFFFFF')
-        ws_at.cell(1,1).fill=hdr_fill_at; ws_at.merge_cells('A1:H1')
-        at_sum_rows = [
-            ('P&L Trades', round(at_pnl,4)), ('Funding Total', round(at_fund,4)),
-            ('P&L Total', round(at_pnl+at_fund,4)), ('Capital Cuenta', round(at_bal,2)),
-            ('% Rentabilidad', f"{round((at_pnl+at_fund)/at_bal*100,2) if at_bal else 0}%"),
-            ('Trades Cerrados', len(at_closes)), ('Win Rate', f"{at_wr}%"),
-        ]
-        for i,(k,v) in enumerate(at_sum_rows,2):
-            ws_at.cell(i,1,k).font=Font(bold=True)
-            vc=ws_at.cell(i,2,v); vc.border=thin; style_pnl_cell(vc,v)
-        r=len(at_sum_rows)+4
-        ws_at.cell(r,1,'HISTORIAL DE TRADES').font=Font(bold=True,size=12,color='FFFFFF')
-        ws_at.cell(r,1).fill=hdr_fill_at; ws_at.merge_cells(start_row=r,start_column=1,end_row=r,end_column=8); r+=1
-        style_header_row(ws_at,r,['Fecha','Mercado','Tipo','Lado','Precio','Tamaño','P&L (USDC)','Fee'],hdr_fill_at); r+=1
-        for t in sorted(aster_trades.values(), key=lambda t: int(t.get('ts',0) or 0), reverse=True):
-            row_data=[fmt_ts(t.get('ts')),t.get('symbol',''),'Cierre',(t.get('side','') or '').upper(),round(float(t.get('price') or 0),4) or '',round(float(t.get('size') or 0),6) or '',t.get('pnl') if t.get('pnl') is not None else '',round(float(t.get('fee') or 0),6) or '']
-            for col,val in enumerate(row_data,1):
-                cell=ws_at.cell(r,col,val); cell.border=thin
-                if col==1: cell.alignment=center
-            style_pnl_cell(ws_at.cell(r,7),row_data[6]); r+=1
-        r+=1
-        ws_at.cell(r,1,'FUNDING FEES').font=Font(bold=True,size=12,color='FFFFFF')
-        ws_at.cell(r,1).fill=hdr_fill_at; ws_at.merge_cells(start_row=r,start_column=1,end_row=r,end_column=3); r+=1
-        style_header_row(ws_at,r,['Fecha','Mercado','Pago (USDC)'],hdr_fill_at); r+=1
-        for f in sorted(aster_funding.values(), key=lambda f: int(f.get('ts',0) or 0), reverse=True):
-            row_data=[fmt_ts(f.get('ts')),f.get('symbol',''),f.get('payment','')]
-            for col,val in enumerate(row_data,1):
-                cell=ws_at.cell(r,col,val); cell.border=thin
-            style_pnl_cell(ws_at.cell(r,3),f.get('payment')); r+=1
-        set_col_widths(ws_at,[18,12,10,8,14,14,16,14])
-
-        # Save
-        buf = _io.BytesIO()
-        wb.save(buf); buf.seek(0)
-        fname = f"registro_dex_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
-        return web.Response(
-            body=buf.read(),
-            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            headers={'Content-Disposition': f'attachment; filename="{fname}"',
-                     'Access-Control-Allow-Origin': '*'}
-        )
-    except Exception as e:
-        log.error(f"Excel export error: {e}")
-        import traceback; traceback.print_exc()
-        return cors(web.json_response({'error': str(e)}, status=500))
-
-
 async def h_options(req):
     return web.Response(headers={
         'Access-Control-Allow-Origin': '*',
@@ -1559,8 +1216,6 @@ def create_app():
     app.router.add_post('/hl/clear_funding', h_hl_clear_funding)
     app.router.add_get('/hl/trades', h_hl_trades)
     app.router.add_get('/hl/positions', h_hl_positions)
-    app.router.add_get('/export/excel', h_export_excel)
-    app.router.add_get('/eur/rates', h_eur_rates)
     app.router.add_options('/{p:.*}', h_options)
     app.on_startup.append(on_start)
     app.on_cleanup.append(on_stop)
