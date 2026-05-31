@@ -195,20 +195,29 @@ async def load_positions(session, account):
         async with session.get(f"{BASE}/api/v1/account?by=index&value={account}", headers=hdrs()) as r:
             if r.status == 200:
                 data = await r.json()
-                # Extract account balance/equity
-                acct = data.get('account') or data.get('account_info') or data
-                for key in ['total_account_value','account_value','equity','total_equity',
-                            'total_collateral','collateral','balance','total_balance',
-                            'net_account_value','portfolio_value']:
-                    val = acct.get(key)
-                    if val is not None:
-                        try:
-                            account_balance['value'] = float(val)
-                            account_balance['field'] = key
-                            log.info(f"Account balance: {key}={val}")
-                            break
-                        except: pass
-                for mid, pos in (data.get('positions') or {}).items():
+                # Extract account balance from accounts array
+                accounts = data.get('accounts') or []
+                if accounts:
+                    acct = accounts[0]
+                    # total_asset_value is the full account value including open positions
+                    for key in ['total_asset_value','cross_asset_value','collateral','available_balance']:
+                        val = acct.get(key)
+                        if val is not None:
+                            try:
+                                account_balance['value'] = float(val)
+                                account_balance['field'] = key
+                                log.info(f"Account balance: {key}={val}")
+                                break
+                            except: pass
+                    positions_data = acct.get('positions') or []
+                else:
+                    positions_data = (data.get('positions') or {})
+                # handle both list and dict formats
+                if isinstance(positions_data, list):
+                    pos_iter = {str(p['market_id']): p for p in positions_data if float(p.get('position',0)) != 0}.items()
+                else:
+                    pos_iter = positions_data.items()
+                for mid, pos in pos_iter:
                     positions[str(mid)] = {
                         'market_id': mid, 'symbol': sym(mid),
                         'side': 'long' if int(pos.get('sign', 1)) > 0 else 'short',
