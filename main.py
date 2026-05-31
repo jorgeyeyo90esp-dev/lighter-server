@@ -292,6 +292,57 @@ async def hl_post(session, payload):
         log.error(f"HL API: {e}")
     return None
 
+async def load_hl_funding_all(session):
+    """Load all funding using userNonFundingLedgerUpdates + userFundingHistory with pagination."""
+    global hl_funding
+    now_ms = int(time.time() * 1000)
+    start_ms = 1700000000000
+    total = 0
+
+    # Method 1: userFundingHistory standard perps (paginated)
+    cursor_ts = start_ms
+    while True:
+        data = await hl_post(session, {"type": "userFundingHistory", "user": HL_WALLET, "startTime": cursor_ts})
+        if not data or not isinstance(data, list) or len(data) == 0:
+            break
+        for f in data:
+            delta = f.get('delta', {})
+            ts = int(f.get('time', 0))
+            payment = float(delta.get('usdc', 0))
+            coin = delta.get('coin', '?')
+            fid = f"hl_std_{ts}_{coin}"
+            hl_funding[fid] = {'id': fid, 'symbol': coin, 'payment': payment, 'ts': ts, 'source': 'hl_api'}
+            total += 1
+        if len(data) < 500:
+            break
+        cursor_ts = data[-1]['time'] + 1
+        await asyncio.sleep(0.2)
+
+    # Method 2: userNonFundingLedgerUpdates — contains funding-like entries for HIP-3
+    cursor_ts = start_ms
+    while True:
+        data = await hl_post(session, {"type": "userNonFundingLedgerUpdates", "user": HL_WALLET, "startTime": cursor_ts})
+        if not data or not isinstance(data, list) or len(data) == 0:
+            break
+        for f in data:
+            delta = f.get('delta', {})
+            dtype = delta.get('type', '')
+            # Only include funding-type entries, not deposits/withdrawals/transfers
+            if dtype in ('funding', 'fundingPayment', 'perpFunding', 'hip3Funding'):
+                ts = int(f.get('time', 0))
+                payment = float(delta.get('usdc', 0) or delta.get('amount', 0))
+                coin = delta.get('coin', delta.get('asset', '?'))
+                fid = f"hl_nfl_{ts}_{coin}_{dtype}"
+                hl_funding[fid] = {'id': fid, 'symbol': coin, 'payment': payment, 'ts': ts, 'source': 'hl_ledger'}
+                total += 1
+        if len(data) < 500:
+            break
+        cursor_ts = data[-1]['time'] + 1
+        await asyncio.sleep(0.2)
+
+    ft = round(sum(f['payment'] for f in hl_funding.values()), 4)
+    log.info(f"HL funding loaded: {len(hl_funding)} entries, total={ft} USDC")
+
 async def load_hl_data():
     global hl_trades, hl_funding, hl_positions, hl_account_value, hl_loading, hl_load_done, hl_last_update
     if not HL_WALLET:
@@ -329,8 +380,8 @@ async def load_hl_data():
                 }
             log.info(f"HL fills: {len(hl_trades)}")
 
-        # 2. Funding — loaded via CSV upload endpoint (see /hl/upload_funding)
-        log.info(f"HL funding: {len(hl_funding)} payments (loaded from CSV uploads)")
+        # 2. Funding via userNonFundingLedgerUpdates (paginated) + userFundingHistory standard
+        await load_hl_funding_all(session)
 
         # 3. Current positions + account value from portfolio + spot balance
         data = await hl_post(session, {"type": "clearinghouseState", "user": HL_WALLET})
@@ -352,17 +403,37 @@ async def load_hl_data():
                     'leverage': p.get('leverage', {}).get('value', 1),
                 }
 
-        # Get real account value from portfolio allTime (most accurate)
+        # Also load HIP-3 positions (dex=xyz)
+        xyz_data = await hl_post(session, {"type": "clearinghouseState", "user": HL_WALLET, "dex": "xyz"})
+        if xyz_data:
+            xyz_margin = float(xyz_data.get('marginSummary', {}).get('accountValue', 0))
+            for pos in (xyz_data.get('assetPositions', [])):
+                p = pos.get('position', {})
+                coin = 'xyz:' + p.get('coin', '?')
+                size = float(p.get('szi', 0))
+                if size == 0: continue
+                hl_positions[coin] = {
+                    'symbol': coin,
+                    'side': 'long' if size > 0 else 'short',
+                    'size': abs(size),
+                    'avg_entry': float(p.get('entryPx', 0) or 0),
+                    'unrealized_pnl': float(p.get('unrealizedPnl', 0) or 0),
+                    'realized_pnl': 0,
+                    'liquidation_price': float(p.get('liquidationPx', 0) or 0),
+                    'leverage': p.get('leverage', {}).get('value', 1),
+                }
+
+        # Account value: portfolio allTime + xyz perp value
         portfolio = await hl_post(session, {"type": "portfolio", "user": HL_WALLET})
         if portfolio and isinstance(portfolio, list):
             for period_data in portfolio:
                 if isinstance(period_data, list) and period_data[0] == 'allTime':
                     history = period_data[1].get('accountValueHistory', [])
                     if history:
-                        hl_account_value = float(history[-1][1])
+                        spot_val = float(history[-1][1])
+                        hl_account_value = spot_val + (xyz_margin if xyz_data else 0)
                         break
 
-        # Also get spot USDC balance as fallback
         if hl_account_value == 0:
             spot = await hl_post(session, {"type": "spotClearinghouseState", "user": HL_WALLET})
             if spot:
@@ -386,7 +457,7 @@ async def hl_incremental():
         return
     log.info("HL incremental update...")
     async with ClientSession() as session:
-        log.info(f"HL incremental: funding unchanged ({len(hl_funding)} from CSV)")
+        await load_hl_funding_all(session)
         # Get latest fills
         data = await hl_post(session, {"type": "userFills", "user": HL_WALLET})
         if data and isinstance(data, list):
