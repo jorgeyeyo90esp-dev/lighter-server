@@ -64,15 +64,8 @@ def from_ms(ms):
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
 
 def today_start_ms():
-    try:
-        import zoneinfo
-        tz = zoneinfo.ZoneInfo('Europe/Madrid')
-    except Exception:
-        from datetime import timedelta
-        tz = timezone(timedelta(hours=2))
-    now_local = datetime.now(tz)
-    midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    return int(midnight_local.timestamp() * 1000)
+    now = datetime.now(timezone.utc)
+    return to_ms(now.replace(hour=0, minute=0, second=0, microsecond=0))
 
 async def load_markets(session):
     global market_map
@@ -123,24 +116,17 @@ async def export_call(session, account, start_ms, end_ms, etype):
     try:
         async with session.get(url, headers=hdrs()) as r:
             if r.status != 200:
-                body = await r.text()
-                if r.status == 400 and 'no export data' in body:
-                    log.debug(f"export_call {etype}: no data for this period (normal)")
-                else:
-                    log.error(f"export_call {etype} HTTP {r.status}: {body[:200]}")
                 return None
             data = await r.json()
             data_url = data.get('data_url') or data.get('url')
             if not data_url:
-                log.error(f"export_call {etype}: no data_url in response: {str(data)[:200]}")
                 return None
         async with session.get(data_url) as r:
             if r.status != 200:
-                log.error(f"export_call {etype} data_url HTTP {r.status}")
                 return None
             return await r.text()
     except Exception as e:
-        log.error(f"export_call {etype}: {e}")
+        log.debug(f"export_call {etype}: {e}")
         return None
 
 async def load_all_funding(session, account, start_ts=None):
