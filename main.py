@@ -733,6 +733,22 @@ async def h_hl_clear_funding(req):
     hl_funding = {k: v for k, v in hl_funding.items() if v.get('source') != 'hl_csv'}
     return cors(web.json_response({'ok': True, 'remaining': len(hl_funding)}))
 
+async def h_hl_ledger_inspect(req):
+    wallet = HL_WALLET
+    async with ClientSession() as session:
+        data = await hl_post(session, {"type": "userNonFundingLedgerUpdates", "user": wallet, "startTime": 1700000000000})
+        # Show all unique delta types and all entries
+        types = {}
+        for f in (data or []):
+            dtype = f.get('delta', {}).get('type', 'unknown')
+            if dtype not in types:
+                types[dtype] = f
+        return cors(web.json_response({
+            'total': len(data) if data else 0,
+            'unique_types': list(types.keys()),
+            'examples': types
+        }))
+
 async def h_hl_funding_test(req):
     """Test all possible funding endpoints with pagination."""
     wallet = HL_WALLET
@@ -874,6 +890,7 @@ def create_app():
     app.router.add_get('/hl/summary', h_hl_summary)
     app.router.add_get('/hl/debug', h_hl_debug)
     app.router.add_get('/hl/funding_test', h_hl_funding_test)
+    app.router.add_get('/hl/ledger', h_hl_ledger_inspect)
     app.router.add_post('/hl/upload_funding', h_hl_upload_funding)
     app.router.add_post('/hl/clear_funding', h_hl_clear_funding)
     app.router.add_get('/hl/trades', h_hl_trades)
