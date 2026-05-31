@@ -324,9 +324,17 @@ async def aster_get(session, path, params=None, signed=False):
         async with session.get(url, headers=headers) as r:
             if r.status == 200:
                 return await r.json()
+            elif r.status in (418, 429):
+                body = await r.text()
+                log.error(f"Aster {path} RATE LIMITED {r.status}: {body[:150]}")
+                return None
+            elif r.status == 401:
+                body = await r.text()
+                log.error(f"Aster {path} AUTH ERROR {r.status}: {body[:150]}")
+                return None
             else:
                 body = await r.text()
-                log.error(f"Aster {path} HTTP {r.status}: {body[:200]}")
+                log.error(f"Aster {path} HTTP {r.status}: {body[:150]}")
     except Exception as e:
         log.error(f"Aster {path}: {e}")
     return None
@@ -345,11 +353,16 @@ async def load_aster_income(session, income_type, start_ms):
             'endTime': end,
             'limit': 1000
         }, signed=True)
-        if data and isinstance(data, list):
+        if data is None:
+            # Error (401/418/429) — stop immediately
+            log.warning(f"Aster {income_type}: stopping due to error")
+            break
+        if isinstance(data, list):
             results.extend(data)
-            log.info(f"Aster {income_type}: +{len(data)} (cursor {cursor})")
+            if len(data) > 0:
+                log.info(f"Aster {income_type}: +{len(data)} (total {len(results)})")
         cursor = end + 1
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(1.0)  # Be respectful with rate limits
     return results
 
 async def load_aster_data():
