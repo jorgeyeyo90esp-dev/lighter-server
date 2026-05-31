@@ -22,6 +22,17 @@ initial_load_done = False
 last_incremental = 0
 
 TOKEN = os.environ.get('LIGHTER_TOKEN', '')
+HL_WALLET = os.environ.get('HL_WALLET', '')  # Hyperliquid wallet address
+HL_BASE = 'https://api.hyperliquid.xyz/info'
+
+# Hyperliquid state
+hl_trades = {}
+hl_funding = {}
+hl_positions = {}
+hl_account_value = None
+hl_loading = False
+hl_load_done = False
+hl_last_update = 0
 BASE = 'https://mainnet.zklighter.elliot.ai'
 BASE_WS = 'wss://mainnet.zklighter.elliot.ai/stream'
 GENESIS_MS = 1737072000000
@@ -270,6 +281,198 @@ def process_ws_position(p):
     except Exception as e:
         log.debug(f"ws_pos: {e}")
 
+async def hl_post(session, payload):
+    try:
+        async with session.post(HL_BASE,
+                               json=payload,
+                               headers={'Content-Type': 'application/json'}) as r:
+            if r.status == 200:
+                return await r.json()
+    except Exception as e:
+        log.error(f"HL API: {e}")
+    return None
+
+async def load_hl_data():
+    global hl_trades, hl_funding, hl_positions, hl_account_value, hl_loading, hl_load_done, hl_last_update
+    if not HL_WALLET:
+        log.info("No HL_WALLET set, skipping Hyperliquid")
+        return
+    hl_loading = True
+    log.info(f"Loading Hyperliquid data for {HL_WALLET}...")
+    async with ClientSession() as session:
+        # 1. User fills (trades with closedPnl)
+        data = await hl_post(session, {"type": "userFills", "user": HL_WALLET})
+        if data and isinstance(data, list):
+            for f in data:
+                coin = f.get('coin', '?')
+                dir_raw = (f.get('dir', '')).lower()
+                is_open = 'open' in dir_raw
+                is_long = 'long' in dir_raw or f.get('side','') == 'B'
+                pnl_raw = f.get('closedPnl', '0')
+                pnl = float(pnl_raw) if pnl_raw and pnl_raw != '0' and not is_open else None
+                ts = int(f.get('time', 0))
+                price = float(f.get('px', 0))
+                size = float(f.get('sz', 0))
+                fee = float(f.get('fee', 0))
+                tid = str(f.get('tid', '')) or str(f.get('hash','')) or f"{ts}_{coin}_{price}"
+                hl_trades[tid] = {
+                    'id': tid,
+                    'symbol': coin,
+                    'side': 'long' if is_long else 'short',
+                    'tradeType': 'open' if is_open else 'close',
+                    'price': price,
+                    'size': size,
+                    'pnl': pnl if pnl != 0.0 else None,
+                    'fee': fee,
+                    'ts': ts,
+                    'source': 'hl'
+                }
+            log.info(f"HL fills: {len(hl_trades)}")
+
+        # 2. Funding history
+        data = await hl_post(session, {"type": "userFundingHistory",
+                                        "user": HL_WALLET,
+                                        "startTime": 1700000000000})
+        if data and isinstance(data, list):
+            for i, f in enumerate(data):
+                delta = f.get('delta', {})
+                fid = f"hl_f_{i}_{f.get('time','')}"
+                payment = float(delta.get('usdc', 0))
+                coin = delta.get('coin', '?')
+                hl_funding[fid] = {
+                    'id': fid,
+                    'symbol': coin,
+                    'payment': payment,
+                    'ts': int(f.get('time', 0)),
+                    'source': 'hl'
+                }
+            log.info(f"HL funding: {len(hl_funding)} payments")
+
+        # 3. Current positions + account value
+        data = await hl_post(session, {"type": "clearinghouseState", "user": HL_WALLET})
+        if data:
+            margin = data.get('marginSummary', {})
+            hl_account_value = float(margin.get('accountValue', 0))
+            for pos in (data.get('assetPositions', [])):
+                p = pos.get('position', {})
+                coin = p.get('coin', '?')
+                size = float(p.get('szi', 0))
+                if size == 0:
+                    continue
+                hl_positions[coin] = {
+                    'symbol': coin,
+                    'side': 'long' if size > 0 else 'short',
+                    'size': abs(size),
+                    'avg_entry': float(p.get('entryPx', 0) or 0),
+                    'unrealized_pnl': float(p.get('unrealizedPnl', 0) or 0),
+                    'realized_pnl': float(p.get('returnOnEquity', 0) or 0),
+                    'liquidation_price': float(p.get('liquidationPx', 0) or 0),
+                    'leverage': p.get('leverage', {}).get('value', 1),
+                }
+            log.info(f"HL positions: {len(hl_positions)}, account value: {hl_account_value}")
+
+        hl_load_done = True
+        hl_loading = False
+        hl_last_update = int(time.time() * 1000)
+        wp = sum(1 for t in hl_trades.values() if t.get('pnl') is not None)
+        ft = round(sum(f['payment'] for f in hl_funding.values()), 4)
+        log.info(f"HL DONE: {len(hl_trades)} fills ({wp} with PnL), funding={ft}")
+
+async def hl_incremental():
+    global hl_trades, hl_positions, hl_account_value, hl_last_update
+    if not HL_WALLET or not hl_load_done:
+        return
+    log.info("HL incremental update...")
+    async with ClientSession() as session:
+        # Get latest fills
+        data = await hl_post(session, {"type": "userFills", "user": HL_WALLET})
+        if data and isinstance(data, list):
+            before = len(hl_trades)
+            for f in data:
+                coin = f.get('coin', '?')
+                dir_raw = (f.get('dir', '')).lower()
+                is_open = 'open' in dir_raw
+                is_long = 'long' in dir_raw or f.get('side','') == 'B'
+                pnl_raw = f.get('closedPnl', '0')
+                pnl = float(pnl_raw) if pnl_raw and pnl_raw != '0' and not is_open else None
+                ts = int(f.get('time', 0))
+                price = float(f.get('px', 0))
+                size = float(f.get('sz', 0))
+                fee = float(f.get('fee', 0))
+                tid = str(f.get('tid', '')) or f"{ts}_{coin}_{price}"
+                hl_trades[tid] = {
+                    'id': tid, 'symbol': coin,
+                    'side': 'long' if is_long else 'short',
+                    'tradeType': 'open' if is_open else 'close',
+                    'price': price, 'size': size,
+                    'pnl': pnl if pnl != 0.0 else None,
+                    'fee': fee, 'ts': ts, 'source': 'hl'
+                }
+            log.info(f"HL incremental: +{len(hl_trades)-before} new fills")
+        # Refresh positions
+        data = await hl_post(session, {"type": "clearinghouseState", "user": HL_WALLET})
+        if data:
+            margin = data.get('marginSummary', {})
+            hl_account_value = float(margin.get('accountValue', 0))
+            hl_positions.clear()
+            for pos in (data.get('assetPositions', [])):
+                p = pos.get('position', {})
+                coin = p.get('coin', '?')
+                size = float(p.get('szi', 0))
+                if size == 0: continue
+                hl_positions[coin] = {
+                    'symbol': coin,
+                    'side': 'long' if size > 0 else 'short',
+                    'size': abs(size),
+                    'avg_entry': float(p.get('entryPx', 0) or 0),
+                    'unrealized_pnl': float(p.get('unrealizedPnl', 0) or 0),
+                    'realized_pnl': 0,
+                    'liquidation_price': float(p.get('liquidationPx', 0) or 0),
+                    'leverage': p.get('leverage', {}).get('value', 1),
+                }
+        hl_last_update = int(time.time() * 1000)
+
+def build_hl_summary():
+    closes = [t for t in hl_trades.values() if t.get('tradeType') == 'close' and t.get('pnl') is not None]
+    pnls = [t['pnl'] for t in closes]
+    ft = round(sum(f['payment'] for f in hl_funding.values()), 4)
+    tp = round(sum(pnls), 4)
+    wins = sum(1 for p in pnls if p > 0)
+    losses = sum(1 for p in pnls if p < 0)
+    wr = round(wins / len(pnls) * 100, 1) if pnls else 0
+    ts = today_start_ms()
+    today_c = [t for t in closes if int(t.get('ts', 0) or 0) >= ts]
+    today_pnl = round(sum(t['pnl'] for t in today_c), 4)
+    today_f = round(sum(f['payment'] for f in hl_funding.values() if int(f.get('ts',0) or 0) >= ts), 4)
+    by_sym = {}
+    for t in closes:
+        s = t.get('symbol', '?')
+        if s not in by_sym:
+            by_sym[s] = {'symbol': s, 'trades': 0, 'pnl': 0.0, 'wins': 0, 'losses': 0, 'best': None, 'worst': None}
+        m = by_sym[s]; m['trades'] += 1; m['pnl'] += t['pnl']
+        if t['pnl'] > 0: m['wins'] += 1
+        elif t['pnl'] < 0: m['losses'] += 1
+        if m['best'] is None or t['pnl'] > m['best']: m['best'] = t['pnl']
+        if m['worst'] is None or t['pnl'] < m['worst']: m['worst'] = t['pnl']
+    for s in by_sym:
+        by_sym[s]['pnl'] = round(by_sym[s]['pnl'], 4)
+        if by_sym[s]['best']: by_sym[s]['best'] = round(by_sym[s]['best'], 4)
+        if by_sym[s]['worst']: by_sym[s]['worst'] = round(by_sym[s]['worst'], 4)
+    return {
+        'total_pnl': round(tp + ft, 4),
+        'trade_pnl': tp, 'funding_total': ft,
+        'today_pnl': round(today_pnl + today_f, 4),
+        'today_trades': len(today_c),
+        'total_trades': len(hl_trades), 'closed_trades': len(closes),
+        'wins': wins, 'losses': losses, 'win_rate': wr,
+        'by_symbol': list(by_sym.values()),
+        'positions': list(hl_positions.values()),
+        'account_balance': hl_account_value,
+        'loading': hl_loading,
+        'initial_load_done': hl_load_done,
+        'last_update': hl_last_update
+    }
+
 async def ws_listener():
     global connected, last_update
     account = get_account()
@@ -402,6 +605,17 @@ async def h_summary(req):
         'last_update': last_update
     }))
 
+async def h_hl_summary(req):
+    return cors(web.json_response(build_hl_summary()))
+
+async def h_hl_trades(req):
+    limit = int(req.rel_url.query.get('limit', 20000))
+    all_t = sorted(hl_trades.values(), key=lambda t: int(t.get('ts',0) or 0), reverse=True)
+    return cors(web.json_response({'trades': all_t[:limit], 'total': len(all_t)}))
+
+async def h_hl_positions(req):
+    return cors(web.json_response({'positions': list(hl_positions.values())}))
+
 async def h_account_debug(req):
     account = get_account()
     try:
@@ -421,11 +635,23 @@ async def h_options(req):
 
 async def on_start(app):
     app['task'] = asyncio.ensure_future(ws_listener())
+    if HL_WALLET:
+        app['hl_task'] = asyncio.ensure_future(hl_main_loop())
+
+async def hl_main_loop():
+    await load_hl_data()
+    while True:
+        await asyncio.sleep(900)  # refresh every 15 min
+        await hl_incremental()
 
 async def on_stop(app):
     app['task'].cancel()
     try: await app['task']
     except asyncio.CancelledError: pass
+    if 'hl_task' in app:
+        app['hl_task'].cancel()
+        try: await app['hl_task']
+        except asyncio.CancelledError: pass
 
 def create_app():
     app = web.Application()
@@ -436,6 +662,9 @@ def create_app():
     app.router.add_get('/positions', h_positions)
     app.router.add_get('/summary', h_summary)
     app.router.add_get('/debug/account', h_account_debug)
+    app.router.add_get('/hl/summary', h_hl_summary)
+    app.router.add_get('/hl/trades', h_hl_trades)
+    app.router.add_get('/hl/positions', h_hl_positions)
     app.router.add_options('/{p:.*}', h_options)
     app.on_startup.append(on_start)
     app.on_cleanup.append(on_stop)
