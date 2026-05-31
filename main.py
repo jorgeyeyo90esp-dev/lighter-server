@@ -17,6 +17,7 @@ positions = {}
 market_map = {}
 connected = False
 last_update = 0
+account_balance = {'value': None, 'field': ''}
 initial_load_done = False
 last_incremental = 0
 
@@ -189,11 +190,25 @@ async def incremental_update(session, account):
     last_incremental = now_ms
 
 async def load_positions(session, account):
-    global positions
+    global positions, account_balance
     try:
         async with session.get(f"{BASE}/api/v1/account?by=index&value={account}", headers=hdrs()) as r:
             if r.status == 200:
-                for mid, pos in ((await r.json()).get('positions') or {}).items():
+                data = await r.json()
+                # Extract account balance/equity
+                acct = data.get('account') or data.get('account_info') or data
+                for key in ['total_account_value','account_value','equity','total_equity',
+                            'total_collateral','collateral','balance','total_balance',
+                            'net_account_value','portfolio_value']:
+                    val = acct.get(key)
+                    if val is not None:
+                        try:
+                            account_balance['value'] = float(val)
+                            account_balance['field'] = key
+                            log.info(f"Account balance: {key}={val}")
+                            break
+                        except: pass
+                for mid, pos in (data.get('positions') or {}).items():
                     positions[str(mid)] = {
                         'market_id': mid, 'symbol': sym(mid),
                         'side': 'long' if int(pos.get('sign', 1)) > 0 else 'short',
@@ -374,6 +389,7 @@ async def h_summary(req):
         'positions': list(positions.values()),
         'connected': connected,
         'initial_load_done': initial_load_done,
+        'account_balance': account_balance.get('value'),
         'last_update': last_update
     }))
 
