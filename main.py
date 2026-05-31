@@ -25,6 +25,19 @@ TOKEN = os.environ.get('LIGHTER_TOKEN', '')
 HL_WALLET = os.environ.get('HL_WALLET', '')  # Hyperliquid wallet address
 HL_BASE = 'https://api.hyperliquid.xyz/info'
 
+# Aster state
+aster_trades = {}
+aster_funding = {}
+aster_positions = {}
+aster_account_value = None
+aster_loading = False
+aster_load_done = False
+aster_last_update = 0
+
+ASTER_BASE = 'https://fapi.asterdex.com'
+ASTER_API_KEY = os.environ.get('ASTER_API_KEY', '')
+ASTER_SECRET = os.environ.get('ASTER_SECRET', '')
+
 # Hyperliquid state
 hl_trades = {}
 hl_funding = {}
@@ -291,6 +304,204 @@ async def hl_post(session, payload):
     except Exception as e:
         log.error(f"HL API: {e}")
     return None
+
+import hmac as _hmac
+import hashlib as _hashlib
+
+def aster_sign(params: dict) -> str:
+    query = '&'.join(f"{k}={v}" for k, v in sorted(params.items()))
+    return _hmac.new(ASTER_SECRET.encode(), query.encode(), _hashlib.sha256).hexdigest()
+
+async def aster_get(session, path, params=None, signed=False):
+    params = params or {}
+    if signed:
+        params['timestamp'] = int(time.time() * 1000)
+        params['recvWindow'] = 10000
+        params['signature'] = aster_sign(params)
+    headers = {'X-MBX-APIKEY': ASTER_API_KEY}
+    url = ASTER_BASE + path + ('?' + '&'.join(f"{k}={v}" for k, v in params.items()) if params else '')
+    try:
+        async with session.get(url, headers=headers) as r:
+            if r.status == 200:
+                return await r.json()
+            else:
+                body = await r.text()
+                log.error(f"Aster {path} HTTP {r.status}: {body[:200]}")
+    except Exception as e:
+        log.error(f"Aster {path}: {e}")
+    return None
+
+async def load_aster_income(session, income_type, start_ms):
+    """Load income history with 7-day chunks (Aster limit)."""
+    results = []
+    now_ms = int(time.time() * 1000)
+    chunk_ms = 7 * 24 * 60 * 60 * 1000  # 7 days max per request
+    cursor = start_ms
+    while cursor < now_ms:
+        end = min(cursor + chunk_ms, now_ms)
+        data = await aster_get(session, '/fapi/v1/income', {
+            'incomeType': income_type,
+            'startTime': cursor,
+            'endTime': end,
+            'limit': 1000
+        }, signed=True)
+        if data and isinstance(data, list):
+            results.extend(data)
+            log.info(f"Aster {income_type}: +{len(data)} (cursor {cursor})")
+        cursor = end + 1
+        await asyncio.sleep(0.3)
+    return results
+
+async def load_aster_data():
+    global aster_trades, aster_funding, aster_positions, aster_account_value
+    global aster_loading, aster_load_done, aster_last_update
+    if not ASTER_API_KEY or not ASTER_SECRET:
+        log.info("No Aster credentials, skipping")
+        return
+    aster_loading = True
+    log.info("Loading Aster data...")
+    async with ClientSession() as session:
+        # Account balance
+        acct = await aster_get(session, '/fapi/v1/account', signed=True)
+        if acct:
+            aster_account_value = float(acct.get('totalWalletBalance') or acct.get('totalMarginBalance') or 0)
+            log.info(f"Aster account value: {aster_account_value}")
+            for pos in acct.get('positions', []):
+                amt = float(pos.get('positionAmt', 0))
+                if amt == 0:
+                    continue
+                symbol = pos.get('symbol', '?').replace('USDT', '').replace('USDC', '')
+                aster_positions[symbol] = {
+                    'symbol': symbol,
+                    'side': 'long' if amt > 0 else 'short',
+                    'size': abs(amt),
+                    'avg_entry': float(pos.get('entryPrice', 0) or 0),
+                    'unrealized_pnl': float(pos.get('unrealizedProfit', 0) or 0),
+                    'realized_pnl': 0,
+                    'liquidation_price': float(pos.get('liquidationPrice', 0) or 0),
+                    'leverage': int(pos.get('leverage', 1) or 1),
+                }
+
+        # Trades with realized PnL — from income REALIZED_PNL
+        # Aster genesis ~Jan 2024
+        genesis_ms = 1704067200000
+        pnl_rows = await load_aster_income(session, 'REALIZED_PNL', genesis_ms)
+        for i, row in enumerate(pnl_rows):
+            symbol = row.get('symbol', '?').replace('USDT', '').replace('USDC', '')
+            pnl = float(row.get('income', 0))
+            ts = int(row.get('time', 0))
+            tid = f"at_{row.get('tranId', i)}_{ts}"
+            aster_trades[tid] = {
+                'id': tid, 'symbol': symbol,
+                'side': 'long',  # not available in income endpoint
+                'tradeType': 'close',
+                'price': 0, 'size': 0,
+                'pnl': pnl, 'fee': 0,
+                'ts': ts, 'source': 'aster'
+            }
+
+        # Funding fees
+        fund_rows = await load_aster_income(session, 'FUNDING_FEE', genesis_ms)
+        for i, row in enumerate(fund_rows):
+            symbol = row.get('symbol', '?').replace('USDT', '').replace('USDC', '')
+            payment = float(row.get('income', 0))
+            ts = int(row.get('time', 0))
+            fid = f"af_{row.get('tranId', i)}_{ts}"
+            aster_funding[fid] = {
+                'id': fid, 'symbol': symbol,
+                'payment': payment, 'ts': ts, 'source': 'aster'
+            }
+
+        aster_load_done = True
+        aster_loading = False
+        aster_last_update = int(time.time() * 1000)
+        wp = len(aster_trades)
+        ft = round(sum(f['payment'] for f in aster_funding.values()), 4)
+        log.info(f"Aster DONE: {wp} trades with PnL, {len(aster_funding)} funding payments, funding={ft}")
+
+async def aster_incremental(session=None):
+    global aster_trades, aster_funding, aster_positions, aster_account_value, aster_last_update
+    if not ASTER_API_KEY or not ASTER_SECRET or not aster_load_done:
+        return
+    log.info("Aster incremental update...")
+    async with ClientSession() as s:
+        ts = today_start_ms()
+        now_ms = int(time.time() * 1000)
+        # Today's PnL
+        rows = await load_aster_income(s, 'REALIZED_PNL', ts)
+        for i, row in enumerate(rows):
+            symbol = row.get('symbol', '?').replace('USDT', '').replace('USDC', '')
+            pnl = float(row.get('income', 0))
+            ts2 = int(row.get('time', 0))
+            tid = f"at_{row.get('tranId', i)}_{ts2}"
+            aster_trades[tid] = {'id': tid, 'symbol': symbol, 'side': 'long',
+                'tradeType': 'close', 'price': 0, 'size': 0,
+                'pnl': pnl, 'fee': 0, 'ts': ts2, 'source': 'aster'}
+        # Today's funding
+        rows = await load_aster_income(s, 'FUNDING_FEE', ts)
+        for i, row in enumerate(rows):
+            symbol = row.get('symbol', '?').replace('USDT', '').replace('USDC', '')
+            payment = float(row.get('income', 0))
+            ts2 = int(row.get('time', 0))
+            fid = f"af_{row.get('tranId', i)}_{ts2}"
+            aster_funding[fid] = {'id': fid, 'symbol': symbol, 'payment': payment, 'ts': ts2, 'source': 'aster'}
+        # Refresh positions and balance
+        acct = await aster_get(s, '/fapi/v1/account', signed=True)
+        if acct:
+            aster_account_value = float(acct.get('totalWalletBalance') or acct.get('totalMarginBalance') or 0)
+            aster_positions.clear()
+            for pos in acct.get('positions', []):
+                amt = float(pos.get('positionAmt', 0))
+                if amt == 0: continue
+                sym = pos.get('symbol', '?').replace('USDT', '').replace('USDC', '')
+                aster_positions[sym] = {
+                    'symbol': sym, 'side': 'long' if amt > 0 else 'short',
+                    'size': abs(amt), 'avg_entry': float(pos.get('entryPrice', 0) or 0),
+                    'unrealized_pnl': float(pos.get('unrealizedProfit', 0) or 0),
+                    'realized_pnl': 0,
+                    'liquidation_price': float(pos.get('liquidationPrice', 0) or 0),
+                    'leverage': int(pos.get('leverage', 1) or 1),
+                }
+        aster_last_update = int(time.time() * 1000)
+        log.info(f"Aster incremental done: {len(aster_trades)} trades, {len(aster_funding)} funding")
+
+def build_aster_summary():
+    closes = [t for t in aster_trades.values() if t.get('pnl') is not None]
+    pnls = [t['pnl'] for t in closes]
+    ft = round(sum(f['payment'] for f in aster_funding.values()), 4)
+    tp = round(sum(pnls), 4)
+    wins = sum(1 for p in pnls if p > 0)
+    losses = sum(1 for p in pnls if p < 0)
+    wr = round(wins / len(pnls) * 100, 1) if pnls else 0
+    ts = today_start_ms()
+    today_c = [t for t in closes if int(t.get('ts', 0) or 0) >= ts]
+    today_pnl = round(sum(t['pnl'] for t in today_c), 4)
+    today_f = round(sum(f['payment'] for f in aster_funding.values() if int(f.get('ts', 0) or 0) >= ts), 4)
+    by_sym = {}
+    for t in closes:
+        s = t.get('symbol', '?')
+        if s not in by_sym:
+            by_sym[s] = {'symbol': s, 'trades': 0, 'pnl': 0.0, 'wins': 0, 'losses': 0, 'best': None, 'worst': None}
+        m = by_sym[s]; m['trades'] += 1; m['pnl'] += t['pnl']
+        if t['pnl'] > 0: m['wins'] += 1
+        elif t['pnl'] < 0: m['losses'] += 1
+        if m['best'] is None or t['pnl'] > m['best']: m['best'] = t['pnl']
+        if m['worst'] is None or t['pnl'] < m['worst']: m['worst'] = t['pnl']
+    for s in by_sym:
+        by_sym[s]['pnl'] = round(by_sym[s]['pnl'], 4)
+        if by_sym[s]['best']: by_sym[s]['best'] = round(by_sym[s]['best'], 4)
+        if by_sym[s]['worst']: by_sym[s]['worst'] = round(by_sym[s]['worst'], 4)
+    return {
+        'total_pnl': round(tp + ft, 4), 'trade_pnl': tp, 'funding_total': ft,
+        'today_pnl': round(today_pnl + today_f, 4), 'today_trades': len(today_c),
+        'total_trades': len(aster_trades), 'closed_trades': len(closes),
+        'wins': wins, 'losses': losses, 'win_rate': wr,
+        'by_symbol': list(by_sym.values()),
+        'positions': list(aster_positions.values()),
+        'account_balance': aster_account_value,
+        'loading': aster_loading, 'initial_load_done': aster_load_done,
+        'last_update': aster_last_update
+    }
 
 async def load_hl_funding_all(session):
     """Load all funding using userNonFundingLedgerUpdates + userFundingHistory with pagination."""
@@ -836,6 +1047,17 @@ async def h_hl_debug(req):
 
         return cors(web.json_response(results))
 
+async def h_aster_summary(req):
+    return cors(web.json_response(build_aster_summary()))
+
+async def h_aster_trades(req):
+    limit = int(req.rel_url.query.get('limit', 20000))
+    all_t = sorted(aster_trades.values(), key=lambda t: int(t.get('ts', 0) or 0), reverse=True)
+    return cors(web.json_response({'trades': all_t[:limit], 'total': len(all_t)}))
+
+async def h_aster_positions(req):
+    return cors(web.json_response({'positions': list(aster_positions.values())}))
+
 async def h_hl_summary(req):
     return cors(web.json_response(build_hl_summary()))
 
@@ -868,6 +1090,14 @@ async def on_start(app):
     app['task'] = asyncio.ensure_future(ws_listener())
     if HL_WALLET:
         app['hl_task'] = asyncio.ensure_future(hl_main_loop())
+    if ASTER_API_KEY:
+        app['aster_task'] = asyncio.ensure_future(aster_main_loop())
+
+async def aster_main_loop():
+    await load_aster_data()
+    while True:
+        await asyncio.sleep(900)
+        await aster_incremental()
 
 async def hl_main_loop():
     await load_hl_data()
@@ -883,6 +1113,10 @@ async def on_stop(app):
         app['hl_task'].cancel()
         try: await app['hl_task']
         except asyncio.CancelledError: pass
+    if 'aster_task' in app:
+        app['aster_task'].cancel()
+        try: await app['aster_task']
+        except asyncio.CancelledError: pass
 
 def create_app():
     app = web.Application()
@@ -894,6 +1128,9 @@ def create_app():
     app.router.add_get('/summary', h_summary)
     app.router.add_get('/debug/account', h_account_debug)
     app.router.add_get('/hl/summary', h_hl_summary)
+    app.router.add_get('/aster/summary', h_aster_summary)
+    app.router.add_get('/aster/trades', h_aster_trades)
+    app.router.add_get('/aster/positions', h_aster_positions)
     app.router.add_get('/hl/debug', h_hl_debug)
     app.router.add_get('/hl/funding_test', h_hl_funding_test)
     app.router.add_get('/hl/ledger', h_hl_ledger_inspect)
