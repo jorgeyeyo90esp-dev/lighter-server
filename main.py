@@ -423,24 +423,16 @@ async def load_hl_data():
                     'leverage': p.get('leverage', {}).get('value', 1),
                 }
 
-        # Account value: portfolio allTime + xyz perp value
-        portfolio = await hl_post(session, {"type": "portfolio", "user": HL_WALLET})
-        if portfolio and isinstance(portfolio, list):
-            for period_data in portfolio:
-                if isinstance(period_data, list) and period_data[0] == 'allTime':
-                    history = period_data[1].get('accountValueHistory', [])
-                    if history:
-                        spot_val = float(history[-1][1])
-                        hl_account_value = spot_val + (xyz_margin if xyz_data else 0)
-                        break
-
-        if hl_account_value == 0:
-            spot = await hl_post(session, {"type": "spotClearinghouseState", "user": HL_WALLET})
-            if spot:
-                for bal in spot.get('balances', []):
-                    if bal.get('coin') == 'USDC':
-                        hl_account_value = float(bal.get('total', 0))
-                        break
+        # Account value = spot USDC balance + HIP-3 perp account value
+        spot = await hl_post(session, {"type": "spotClearinghouseState", "user": HL_WALLET})
+        spot_usdc = 0
+        if spot:
+            for bal in spot.get('balances', []):
+                if bal.get('coin') == 'USDC':
+                    spot_usdc = float(bal.get('total', 0))
+                    break
+        xyz_val = float(xyz_data.get('marginSummary', {}).get('accountValue', 0)) if xyz_data else 0
+        hl_account_value = spot_usdc + xyz_val
 
         log.info(f"HL positions: {len(hl_positions)}, account value: {hl_account_value}")
 
@@ -485,6 +477,7 @@ async def hl_incremental():
             log.info(f"HL incremental: +{len(hl_trades)-before} new fills")
         # Refresh positions and account value
         data = await hl_post(session, {"type": "clearinghouseState", "user": HL_WALLET})
+        xyz_data2 = await hl_post(session, {"type": "clearinghouseState", "user": HL_WALLET, "dex": "xyz"})
         if data:
             hl_positions.clear()
             for pos in (data.get('assetPositions', [])):
@@ -493,24 +486,37 @@ async def hl_incremental():
                 size = float(p.get('szi', 0))
                 if size == 0: continue
                 hl_positions[coin] = {
-                    'symbol': coin,
-                    'side': 'long' if size > 0 else 'short',
-                    'size': abs(size),
-                    'avg_entry': float(p.get('entryPx', 0) or 0),
+                    'symbol': coin, 'side': 'long' if size > 0 else 'short',
+                    'size': abs(size), 'avg_entry': float(p.get('entryPx', 0) or 0),
                     'unrealized_pnl': float(p.get('unrealizedPnl', 0) or 0),
                     'realized_pnl': 0,
                     'liquidation_price': float(p.get('liquidationPx', 0) or 0),
                     'leverage': p.get('leverage', {}).get('value', 1),
                 }
-        # Refresh account value from portfolio
-        portfolio = await hl_post(session, {"type": "portfolio", "user": HL_WALLET})
-        if portfolio and isinstance(portfolio, list):
-            for period_data in portfolio:
-                if isinstance(period_data, list) and period_data[0] == 'allTime':
-                    history = period_data[1].get('accountValueHistory', [])
-                    if history:
-                        hl_account_value = float(history[-1][1])
-                        break
+        if xyz_data2:
+            for pos in (xyz_data2.get('assetPositions', [])):
+                p = pos.get('position', {})
+                coin = 'xyz:' + p.get('coin', '?')
+                size = float(p.get('szi', 0))
+                if size == 0: continue
+                hl_positions[coin] = {
+                    'symbol': coin, 'side': 'long' if size > 0 else 'short',
+                    'size': abs(size), 'avg_entry': float(p.get('entryPx', 0) or 0),
+                    'unrealized_pnl': float(p.get('unrealizedPnl', 0) or 0),
+                    'realized_pnl': 0,
+                    'liquidation_price': float(p.get('liquidationPx', 0) or 0),
+                    'leverage': p.get('leverage', {}).get('value', 1),
+                }
+        # Recalculate account value
+        spot2 = await hl_post(session, {"type": "spotClearinghouseState", "user": HL_WALLET})
+        spot_usdc2 = 0
+        if spot2:
+            for bal in spot2.get('balances', []):
+                if bal.get('coin') == 'USDC':
+                    spot_usdc2 = float(bal.get('total', 0))
+                    break
+        xyz_val2 = float(xyz_data2.get('marginSummary', {}).get('accountValue', 0)) if xyz_data2 else 0
+        hl_account_value = spot_usdc2 + xyz_val2
         hl_last_update = int(time.time() * 1000)
 
 def build_hl_summary():
