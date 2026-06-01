@@ -908,6 +908,7 @@ async def h_summary(req):
         'today_trade_pnl': today_pnl, 'today_funding': today_f,
         'total_trades': len(trades), 'closed_trades': len(closes),
         'today_trades': len(today_c), 'wins': wins, 'losses': losses, 'win_rate': wr,
+        'funding_fees': [{'ts': f.get('ts'), 'payment': f.get('payment'), 'symbol': f.get('symbol')} for f in funding.values()],
         'by_symbol': list(by_sym.values()),
         'positions': list(positions.values()),
         'connected': connected,
