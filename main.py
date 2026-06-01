@@ -25,9 +25,47 @@ TOKEN = os.environ.get('LIGHTER_TOKEN', '')
 HL_WALLET = os.environ.get('HL_WALLET', '')  # Hyperliquid wallet address
 HL_BASE = 'https://api.hyperliquid.xyz/info'
 
+# Aster state
+aster_trades = {}
+aster_funding = {}
+aster_positions = {}
+aster_account_value = None
+aster_loading = False
+aster_load_done = False
+aster_last_update = 0
+
+ASTER_BASE = 'https://fapi.asterdex.com'
+ASTER_API_KEY = os.environ.get('ASTER_API_KEY', '')
+ASTER_SECRET = os.environ.get('ASTER_SECRET', '')
+
+# Hyperliquid state
+hl_trades = {}
+hl_funding = {}
+hl_positions = {}
+hl_account_value = None
+hl_loading = False
+hl_load_done = False
+hl_last_update = 0
+BASE = 'https://mainnet.zklighter.elliot.ai'
+BASE_WS = 'wss://mainnet.zklighter.elliot.ai/stream'
+GENESIS_MS = 1737072000000
+
+def get_account():
+    try: return TOKEN.split(':')[1]
+    except: return None
+
+def hdrs():
+    return {'Authorization': TOKEN}
+
+def to_ms(dt):
+    return int(dt.timestamp() * 1000)
+
+def from_ms(ms):
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+
 def today_start_ms():
     now = datetime.now(timezone.utc)
-    return int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    return to_ms(now.replace(hour=0, minute=0, second=0, microsecond=0))
 
 async def load_markets(session):
     global market_map
@@ -1126,15 +1164,35 @@ async def h_options(req):
 
 async def on_start(app):
     app['task'] = asyncio.ensure_future(ws_listener())
+    if HL_WALLET:
+        app['hl_task'] = asyncio.ensure_future(hl_main_loop())
+    if ASTER_API_KEY:
+        app['aster_task'] = asyncio.ensure_future(aster_main_loop())
 
+async def aster_main_loop():
+    await load_aster_data()
+    while True:
+        await asyncio.sleep(900)
+        await aster_incremental()
 
-
+async def hl_main_loop():
+    await load_hl_data()
+    while True:
+        await asyncio.sleep(900)  # refresh every 15 min
+        await hl_incremental()
 
 async def on_stop(app):
     app['task'].cancel()
     try: await app['task']
     except asyncio.CancelledError: pass
-
+    if 'hl_task' in app:
+        app['hl_task'].cancel()
+        try: await app['hl_task']
+        except asyncio.CancelledError: pass
+    if 'aster_task' in app:
+        app['aster_task'].cancel()
+        try: await app['aster_task']
+        except asyncio.CancelledError: pass
 
 def create_app():
     app = web.Application()
@@ -1145,6 +1203,19 @@ def create_app():
     app.router.add_get('/positions', h_positions)
     app.router.add_get('/summary', h_summary)
     app.router.add_get('/debug/account', h_account_debug)
+    app.router.add_get('/hl/summary', h_hl_summary)
+    app.router.add_get('/aster/summary', h_aster_summary)
+    app.router.add_get('/aster/trades', h_aster_trades)
+    app.router.add_get('/aster/positions', h_aster_positions)
+    app.router.add_post('/aster/upload_csv', h_aster_upload_csv)
+    app.router.add_post('/aster/clear_csv', h_aster_clear_csv)
+    app.router.add_get('/hl/debug', h_hl_debug)
+    app.router.add_get('/hl/funding_test', h_hl_funding_test)
+    app.router.add_get('/hl/ledger', h_hl_ledger_inspect)
+    app.router.add_post('/hl/upload_funding', h_hl_upload_funding)
+    app.router.add_post('/hl/clear_funding', h_hl_clear_funding)
+    app.router.add_get('/hl/trades', h_hl_trades)
+    app.router.add_get('/hl/positions', h_hl_positions)
     app.router.add_options('/{p:.*}', h_options)
     app.on_startup.append(on_start)
     app.on_cleanup.append(on_stop)
