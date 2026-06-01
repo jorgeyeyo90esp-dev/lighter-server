@@ -649,6 +649,8 @@ async def load_hl_data():
         return
     hl_loading = True
     log.info(f"Loading Hyperliquid data for {HL_WALLET}...")
+    hd_key = os.environ.get('HYPEDEXER_KEY', '')
+    log.info(f"HYPEDEXER_KEY present: {bool(hd_key)} len={len(hd_key)}")
     async with ClientSession() as session:
         # 1. User fills (trades with closedPnl)
         data = await hl_post(session, {"type": "userFills", "user": HL_WALLET})
