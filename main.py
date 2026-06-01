@@ -42,28 +42,32 @@ ASTER_SECRET = os.environ.get('ASTER_SECRET', '')
 HYPEDEXER_BASE = 'https://api.hypedexer.com'
 HYPEDEXER_KEY = os.environ.get('HYPEDEXER_KEY', '')
 
-async def hd_get(session, path, params=None):
+async def hd_get(session, path, params=None, retries=3):
     if not HYPEDEXER_KEY:
         return None
     headers = {'X-API-Key': HYPEDEXER_KEY}
     url = HYPEDEXER_BASE + path
     if params:
         url += '?' + '&'.join(f"{k}={v}" for k, v in params.items())
-    try:
-        async with session.get(url, headers=headers) as r:
-            if r.status == 200:
-                return await r.json()
-            elif r.status == 429:
-                log.warning(f"HypeDexer rate limit on {path}, waiting 2s")
-                await asyncio.sleep(2)
-                return None
-            else:
-                body = await r.text()
-                log.error(f"HypeDexer {path} HTTP {r.status}: {body[:150]}")
-                return None
-    except Exception as e:
-        log.error(f"HypeDexer {path}: {e}")
-        return None
+    for attempt in range(retries):
+        try:
+            async with session.get(url, headers=headers) as r:
+                if r.status == 200:
+                    return await r.json()
+                elif r.status == 429:
+                    wait = int(r.headers.get('Retry-After', 2)) + 1
+                    log.warning(f"HypeDexer rate limit on {path}, waiting {wait}s (attempt {attempt+1})")
+                    await asyncio.sleep(wait)
+                    continue
+                else:
+                    body = await r.text()
+                    log.error(f"HypeDexer {path} HTTP {r.status}: {body[:150]}")
+                    return None
+        except Exception as e:
+            log.error(f"HypeDexer {path}: {e}")
+            return None
+    log.error(f"HypeDexer {path}: all {retries} retries failed")
+    return None
 
     all_fills = []
     cursor = None
