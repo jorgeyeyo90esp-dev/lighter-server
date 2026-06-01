@@ -25,127 +25,6 @@ TOKEN = os.environ.get('LIGHTER_TOKEN', '')
 HL_WALLET = os.environ.get('HL_WALLET', '')  # Hyperliquid wallet address
 HL_BASE = 'https://api.hyperliquid.xyz/info'
 
-# Aster state
-aster_trades = {}
-aster_funding = {}
-aster_positions = {}
-aster_account_value = None
-aster_loading = False
-aster_load_done = False
-aster_last_update = 0
-
-ASTER_BASE = 'https://fapi.asterdex.com'
-ASTER_API_KEY = os.environ.get('ASTER_API_KEY', '')
-ASTER_SECRET = os.environ.get('ASTER_SECRET', '')
-
-# HypeDexer state (enhanced Hyperliquid data)
-HYPEDEXER_BASE = 'https://api.hypedexer.com'
-HYPEDEXER_KEY = os.environ.get('HYPEDEXER_KEY', '')
-
-async def hd_get(session, path, params=None, retries=3):
-    if not HYPEDEXER_KEY:
-        return None
-    headers = {'X-API-Key': HYPEDEXER_KEY}
-    url = HYPEDEXER_BASE + path
-    if params:
-        url += '?' + '&'.join(f"{k}={v}" for k, v in params.items())
-    for attempt in range(retries):
-        try:
-            async with session.get(url, headers=headers) as r:
-                if r.status == 200:
-                    return await r.json()
-                elif r.status == 429:
-                    wait = int(r.headers.get('Retry-After', 2)) + 1
-                    log.warning(f"HypeDexer rate limit on {path}, waiting {wait}s (attempt {attempt+1})")
-                    await asyncio.sleep(wait)
-                    continue
-                else:
-                    body = await r.text()
-                    log.error(f"HypeDexer {path} HTTP {r.status}: {body[:150]}")
-                    return None
-        except Exception as e:
-            log.error(f"HypeDexer {path}: {e}")
-            return None
-    log.error(f"HypeDexer {path}: all {retries} retries failed")
-    return None
-
-    all_fills = []
-    cursor = None
-    page = 0
-    while True:
-        params = {'user': wallet, 'limit': 500}
-        if cursor:
-            params['cursor'] = cursor
-        data = await hd_get(session, '/v1/fills', params)
-        await asyncio.sleep(1.1)  # respect 1 RPS limit
-        if not data:
-            break
-        # Handle both list and dict response
-        fills = data if isinstance(data, list) else data.get('fills', data.get('data', []))
-        if not fills:
-            break
-        all_fills.extend(fills)
-        page += 1
-        log.info(f"HypeDexer fills page {page}: +{len(fills)} (total {len(all_fills)})")
-        # Check for next cursor/page
-        if isinstance(data, dict):
-            cursor = data.get('cursor') or data.get('nextCursor') or data.get('next')
-        if not cursor or len(fills) < 500:
-            break
-    return all_fills
-
-    all_funding = []
-    cursor = None
-    page = 0
-    while True:
-        params = {'user': wallet, 'limit': 500}
-        if cursor:
-            params['cursor'] = cursor
-        data = await hd_get(session, '/v1/funding', params)
-        await asyncio.sleep(1.1)
-        if not data:
-            break
-        items = data if isinstance(data, list) else data.get('funding', data.get('data', []))
-        if not items:
-            break
-        all_funding.extend(items)
-        page += 1
-        log.info(f"HypeDexer funding page {page}: +{len(items)} (total {len(all_funding)})")
-        if isinstance(data, dict):
-            cursor = data.get('cursor') or data.get('nextCursor') or data.get('next')
-        if not cursor or len(items) < 500:
-            break
-    return all_funding
-
-# Hyperliquid state
-hl_trades = {}
-hl_funding = {}
-hl_positions = {}
-hl_account_value = None
-hl_loading = False
-hl_load_done = False
-hl_last_update = 0
-BASE = 'https://mainnet.zklighter.elliot.ai'
-BASE_WS = 'wss://mainnet.zklighter.elliot.ai/stream'
-GENESIS_MS = 1737072000000
-
-def get_account():
-    try: return TOKEN.split(':')[1]
-    except: return None
-
-def hdrs():
-    return {'Authorization': TOKEN}
-
-def to_ms(dt):
-    return int(dt.timestamp() * 1000)
-
-def from_ms(ms):
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
-
-def today_start_ms():
-    now = datetime.now(timezone.utc)
-    return to_ms(now.replace(hour=0, minute=0, second=0, microsecond=0))
-
 async def load_markets(session):
     global market_map
     try:
@@ -653,75 +532,38 @@ async def load_hl_data():
         return
     hl_loading = True
     log.info(f"Loading Hyperliquid data for {HL_WALLET}...")
-    hd_key = os.environ.get('HYPEDEXER_KEY', '')
-    log.info(f"HYPEDEXER_KEY present: {bool(hd_key)} len={len(hd_key)}")
     async with ClientSession() as session:
-        # 1. User fills - use HypeDexer if available for complete history inc. HIP-3
-        if HYPEDEXER_KEY:
-            log.info("Loading HL fills via HypeDexer...")
-            hd_fills = await load_hd_fills(session, HL_WALLET)
-            for f in hd_fills:
+        # 1. User fills (trades with closedPnl)
+        data = await hl_post(session, {"type": "userFills", "user": HL_WALLET})
+        if data and isinstance(data, list):
+            for f in data:
                 coin = f.get('coin', '?')
-                side = 'long' if f.get('side') == 'B' else 'short'
-                ts = int(f.get('time', 0))
+                dir_raw = (f.get('dir', '')).lower()
+                is_open = 'open' in dir_raw
+                is_long = 'long' in dir_raw or f.get('side','') == 'B'
                 pnl_raw = f.get('closedPnl', '0')
-                pnl = float(pnl_raw) if pnl_raw and pnl_raw != '0' else None
-                price = float(f.get('px', 0) or 0)
-                size = float(f.get('sz', 0) or 0)
-                fee = float(f.get('fee', 0) or 0)
-                direction = f.get('dir', '')
-                trade_type = 'close' if 'Close' in direction else 'open'
-                tid = f"hl_{f.get('tid', ts)}"
-                hl_trades[tid] = {
-                    'id': tid, 'symbol': coin, 'side': side,
-                    'tradeType': trade_type, 'price': price, 'size': size,
-                    'pnl': pnl if trade_type == 'close' else None,
-                    'fee': fee, 'ts': ts, 'source': 'hd'
-                }
-            log.info(f"HypeDexer fills loaded: {len(hl_trades)}")
-        else:
-    # 1. User fills (trades with closedPnl)
-            data = await hl_post(session, {"type": "userFills", "user": HL_WALLET})
-            if data and isinstance(data, list):
-                for f in data:
-                    coin = f.get('coin', '?')
-                    dir_raw = (f.get('dir', '')).lower()
-                    is_open = 'open' in dir_raw
-                    is_long = 'long' in dir_raw or f.get('side','') == 'B'
-                    pnl_raw = f.get('closedPnl', '0')
-                    pnl = float(pnl_raw) if pnl_raw and pnl_raw != '0' and not is_open else None
-                    ts = int(f.get('time', 0))
-                    price = float(f.get('px', 0))
-                    size = float(f.get('sz', 0))
-                    fee = float(f.get('fee', 0))
-                    tid = str(f.get('tid', '')) or str(f.get('hash','')) or f"{ts}_{coin}_{price}"
-                    hl_trades[tid] = {
-                        'id': tid,
-                        'symbol': coin,
-                        'side': 'long' if is_long else 'short',
-                        'tradeType': 'open' if is_open else 'close',
-                        'price': price,
-                        'size': size,
-                        'pnl': pnl if pnl != 0.0 else None,
-                        'fee': fee,
-                        'ts': ts,
-                        'source': 'hl'
-                    }
-                log.info(f"HL fills: {len(hl_trades)}")
-
-
-        # 2. Funding - use HypeDexer if available
-        if HYPEDEXER_KEY:
-            hd_fund = await load_hd_funding(session, HL_WALLET)
-            for i, f in enumerate(hd_fund):
+                pnl = float(pnl_raw) if pnl_raw and pnl_raw != '0' and not is_open else None
                 ts = int(f.get('time', 0))
-                payment = float(f.get('usdc', 0) or f.get('payment', 0) or 0)
-                coin = f.get('coin', '?')
-                fid = f"hd_f_{ts}_{i}"
-                hl_funding[fid] = {'id': fid, 'symbol': coin, 'payment': payment, 'ts': ts, 'source': 'hd'}
-            log.info(f"HypeDexer funding loaded: {len(hl_funding)} entries")
-        else:
-            await load_hl_funding_all(session)
+                price = float(f.get('px', 0))
+                size = float(f.get('sz', 0))
+                fee = float(f.get('fee', 0))
+                tid = str(f.get('tid', '')) or str(f.get('hash','')) or f"{ts}_{coin}_{price}"
+                hl_trades[tid] = {
+                    'id': tid,
+                    'symbol': coin,
+                    'side': 'long' if is_long else 'short',
+                    'tradeType': 'open' if is_open else 'close',
+                    'price': price,
+                    'size': size,
+                    'pnl': pnl if pnl != 0.0 else None,
+                    'fee': fee,
+                    'ts': ts,
+                    'source': 'hl'
+                }
+            log.info(f"HL fills: {len(hl_trades)}")
+
+        # 2. Funding via userNonFundingLedgerUpdates (paginated) + userFundingHistory standard
+        await load_hl_funding_all(session)
 
         # 3. Current positions + account value from portfolio + spot balance
         data = await hl_post(session, {"type": "clearinghouseState", "user": HL_WALLET})
@@ -1024,7 +866,6 @@ async def h_summary(req):
         'today_trade_pnl': today_pnl, 'today_funding': today_f,
         'total_trades': len(trades), 'closed_trades': len(closes),
         'today_trades': len(today_c), 'wins': wins, 'losses': losses, 'win_rate': wr,
-        'funding_fees': [{'ts': f.get('ts'), 'payment': f.get('payment'), 'symbol': f.get('symbol')} for f in funding.values()],
         'by_symbol': list(by_sym.values()),
         'positions': list(positions.values()),
         'connected': connected,
@@ -1137,27 +978,6 @@ async def h_hl_funding_test(req):
             results['clearinghouseState_xyz'] = str(e)
 
     return cors(web.json_response(results))
-
-async def h_hd_test(req):
-    wallet = HL_WALLET
-    api_key = os.environ.get('HYPEDEXER_KEY', '')
-    if not api_key:
-        return cors(web.json_response({'error': 'No HYPEDEXER_KEY env var'}))
-    hdrs2 = {'X-API-Key': api_key}
-    async with ClientSession() as session:
-        # Test single call with small limit
-        url = f'https://api.hypedexer.com/v1/fills?user={wallet}&limit=3'
-        try:
-            async with session.get(url, headers=hdrs2) as r:
-                body = await r.text()
-                try:
-                    data = await r.json(content_type=None)
-                except:
-                    data = body[:500]
-                return cors(web.json_response({'status': r.status, 'data': data, 'headers': dict(r.headers)}))
-        except Exception as e:
-            return cors(web.json_response({'error': str(e)}))
-
 
 async def h_hl_debug(req):
     wallet = HL_WALLET
@@ -1302,35 +1122,15 @@ async def h_options(req):
 
 async def on_start(app):
     app['task'] = asyncio.ensure_future(ws_listener())
-    if HL_WALLET:
-        app['hl_task'] = asyncio.ensure_future(hl_main_loop())
-    if ASTER_API_KEY:
-        app['aster_task'] = asyncio.ensure_future(aster_main_loop())
 
-async def aster_main_loop():
-    await load_aster_data()
-    while True:
-        await asyncio.sleep(900)
-        await aster_incremental()
 
-async def hl_main_loop():
-    await load_hl_data()
-    while True:
-        await asyncio.sleep(900)  # refresh every 15 min
-        await hl_incremental()
+
 
 async def on_stop(app):
     app['task'].cancel()
     try: await app['task']
     except asyncio.CancelledError: pass
-    if 'hl_task' in app:
-        app['hl_task'].cancel()
-        try: await app['hl_task']
-        except asyncio.CancelledError: pass
-    if 'aster_task' in app:
-        app['aster_task'].cancel()
-        try: await app['aster_task']
-        except asyncio.CancelledError: pass
+
 
 def create_app():
     app = web.Application()
@@ -1341,20 +1141,6 @@ def create_app():
     app.router.add_get('/positions', h_positions)
     app.router.add_get('/summary', h_summary)
     app.router.add_get('/debug/account', h_account_debug)
-    app.router.add_get('/hl/summary', h_hl_summary)
-    app.router.add_get('/aster/summary', h_aster_summary)
-    app.router.add_get('/aster/trades', h_aster_trades)
-    app.router.add_get('/aster/positions', h_aster_positions)
-    app.router.add_post('/aster/upload_csv', h_aster_upload_csv)
-    app.router.add_post('/aster/clear_csv', h_aster_clear_csv)
-    app.router.add_get('/hl/debug', h_hl_debug)
-    app.router.add_get('/hd/test', h_hd_test)
-    app.router.add_get('/hl/funding_test', h_hl_funding_test)
-    app.router.add_get('/hl/ledger', h_hl_ledger_inspect)
-    app.router.add_post('/hl/upload_funding', h_hl_upload_funding)
-    app.router.add_post('/hl/clear_funding', h_hl_clear_funding)
-    app.router.add_get('/hl/trades', h_hl_trades)
-    app.router.add_get('/hl/positions', h_hl_positions)
     app.router.add_options('/{p:.*}', h_options)
     app.on_startup.append(on_start)
     app.on_cleanup.append(on_stop)
