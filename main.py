@@ -38,6 +38,81 @@ ASTER_BASE = 'https://fapi.asterdex.com'
 ASTER_API_KEY = os.environ.get('ASTER_API_KEY', '')
 ASTER_SECRET = os.environ.get('ASTER_SECRET', '')
 
+# HypeDexer state (enhanced Hyperliquid data)
+HYPEDEXER_BASE = 'https://api.hypedexer.com'
+HYPEDEXER_KEY = os.environ.get('HYPEDEXER_KEY', '')
+
+async def hd_get(session, path, params=None):
+    if not HYPEDEXER_KEY:
+        return None
+    headers = {'X-API-Key': HYPEDEXER_KEY}
+    url = HYPEDEXER_BASE + path
+    if params:
+        url += '?' + '&'.join(f"{k}={v}" for k, v in params.items())
+    try:
+        async with session.get(url, headers=headers) as r:
+            if r.status == 200:
+                return await r.json()
+            elif r.status == 429:
+                log.warning(f"HypeDexer rate limit on {path}, waiting 2s")
+                await asyncio.sleep(2)
+                return None
+            else:
+                body = await r.text()
+                log.error(f"HypeDexer {path} HTTP {r.status}: {body[:150]}")
+                return None
+    except Exception as e:
+        log.error(f"HypeDexer {path}: {e}")
+        return None
+
+    all_fills = []
+    cursor = None
+    page = 0
+    while True:
+        params = {'user': wallet, 'limit': 500}
+        if cursor:
+            params['cursor'] = cursor
+        data = await hd_get(session, '/v1/fills', params)
+        await asyncio.sleep(1.1)  # respect 1 RPS limit
+        if not data:
+            break
+        # Handle both list and dict response
+        fills = data if isinstance(data, list) else data.get('fills', data.get('data', []))
+        if not fills:
+            break
+        all_fills.extend(fills)
+        page += 1
+        log.info(f"HypeDexer fills page {page}: +{len(fills)} (total {len(all_fills)})")
+        # Check for next cursor/page
+        if isinstance(data, dict):
+            cursor = data.get('cursor') or data.get('nextCursor') or data.get('next')
+        if not cursor or len(fills) < 500:
+            break
+    return all_fills
+
+    all_funding = []
+    cursor = None
+    page = 0
+    while True:
+        params = {'user': wallet, 'limit': 500}
+        if cursor:
+            params['cursor'] = cursor
+        data = await hd_get(session, '/v1/funding', params)
+        await asyncio.sleep(1.1)
+        if not data:
+            break
+        items = data if isinstance(data, list) else data.get('funding', data.get('data', []))
+        if not items:
+            break
+        all_funding.extend(items)
+        page += 1
+        log.info(f"HypeDexer funding page {page}: +{len(items)} (total {len(all_funding)})")
+        if isinstance(data, dict):
+            cursor = data.get('cursor') or data.get('nextCursor') or data.get('next')
+        if not cursor or len(items) < 500:
+            break
+    return all_funding
+
 # Hyperliquid state
 hl_trades = {}
 hl_funding = {}
@@ -604,8 +679,18 @@ async def load_hl_data():
                 }
             log.info(f"HL fills: {len(hl_trades)}")
 
-        # 2. Funding via userNonFundingLedgerUpdates (paginated) + userFundingHistory standard
-        await load_hl_funding_all(session)
+        # 2. Funding - use HypeDexer if available
+        if HYPEDEXER_KEY:
+            hd_fund = await load_hd_funding(session, HL_WALLET)
+            for i, f in enumerate(hd_fund):
+                ts = int(f.get('time', 0))
+                payment = float(f.get('usdc', 0) or f.get('payment', 0) or 0)
+                coin = f.get('coin', '?')
+                fid = f"hd_f_{ts}_{i}"
+                hl_funding[fid] = {'id': fid, 'symbol': coin, 'payment': payment, 'ts': ts, 'source': 'hd'}
+            log.info(f"HypeDexer funding loaded: {len(hl_funding)} entries")
+        else:
+            await load_hl_funding_all(session)
 
         # 3. Current positions + account value from portfolio + spot balance
         data = await hl_post(session, {"type": "clearinghouseState", "user": HL_WALLET})
