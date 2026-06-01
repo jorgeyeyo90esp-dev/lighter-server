@@ -25,6 +25,10 @@ TOKEN = os.environ.get('LIGHTER_TOKEN', '')
 HL_WALLET = os.environ.get('HL_WALLET', '')  # Hyperliquid wallet address
 HL_BASE = 'https://api.hyperliquid.xyz/info'
 
+def today_start_ms():
+    now = datetime.now(timezone.utc)
+    return int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+
 async def load_markets(session):
     global market_map
     try:
