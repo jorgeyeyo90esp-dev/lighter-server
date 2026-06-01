@@ -652,34 +652,59 @@ async def load_hl_data():
     hd_key = os.environ.get('HYPEDEXER_KEY', '')
     log.info(f"HYPEDEXER_KEY present: {bool(hd_key)} len={len(hd_key)}")
     async with ClientSession() as session:
-        # 1. User fills (trades with closedPnl)
-        data = await hl_post(session, {"type": "userFills", "user": HL_WALLET})
-        if data and isinstance(data, list):
-            for f in data:
+        # 1. User fills - use HypeDexer if available for complete history inc. HIP-3
+        if HYPEDEXER_KEY:
+            log.info("Loading HL fills via HypeDexer...")
+            hd_fills = await load_hd_fills(session, HL_WALLET)
+            for f in hd_fills:
                 coin = f.get('coin', '?')
-                dir_raw = (f.get('dir', '')).lower()
-                is_open = 'open' in dir_raw
-                is_long = 'long' in dir_raw or f.get('side','') == 'B'
-                pnl_raw = f.get('closedPnl', '0')
-                pnl = float(pnl_raw) if pnl_raw and pnl_raw != '0' and not is_open else None
+                side = 'long' if f.get('side') == 'B' else 'short'
                 ts = int(f.get('time', 0))
-                price = float(f.get('px', 0))
-                size = float(f.get('sz', 0))
-                fee = float(f.get('fee', 0))
-                tid = str(f.get('tid', '')) or str(f.get('hash','')) or f"{ts}_{coin}_{price}"
+                pnl_raw = f.get('closedPnl', '0')
+                pnl = float(pnl_raw) if pnl_raw and pnl_raw != '0' else None
+                price = float(f.get('px', 0) or 0)
+                size = float(f.get('sz', 0) or 0)
+                fee = float(f.get('fee', 0) or 0)
+                direction = f.get('dir', '')
+                trade_type = 'close' if 'Close' in direction else 'open'
+                tid = f"hl_{f.get('tid', ts)}"
                 hl_trades[tid] = {
-                    'id': tid,
-                    'symbol': coin,
-                    'side': 'long' if is_long else 'short',
-                    'tradeType': 'open' if is_open else 'close',
-                    'price': price,
-                    'size': size,
-                    'pnl': pnl if pnl != 0.0 else None,
-                    'fee': fee,
-                    'ts': ts,
-                    'source': 'hl'
+                    'id': tid, 'symbol': coin, 'side': side,
+                    'tradeType': trade_type, 'price': price, 'size': size,
+                    'pnl': pnl if trade_type == 'close' else None,
+                    'fee': fee, 'ts': ts, 'source': 'hd'
                 }
-            log.info(f"HL fills: {len(hl_trades)}")
+            log.info(f"HypeDexer fills loaded: {len(hl_trades)}")
+        else:
+    # 1. User fills (trades with closedPnl)
+            data = await hl_post(session, {"type": "userFills", "user": HL_WALLET})
+            if data and isinstance(data, list):
+                for f in data:
+                    coin = f.get('coin', '?')
+                    dir_raw = (f.get('dir', '')).lower()
+                    is_open = 'open' in dir_raw
+                    is_long = 'long' in dir_raw or f.get('side','') == 'B'
+                    pnl_raw = f.get('closedPnl', '0')
+                    pnl = float(pnl_raw) if pnl_raw and pnl_raw != '0' and not is_open else None
+                    ts = int(f.get('time', 0))
+                    price = float(f.get('px', 0))
+                    size = float(f.get('sz', 0))
+                    fee = float(f.get('fee', 0))
+                    tid = str(f.get('tid', '')) or str(f.get('hash','')) or f"{ts}_{coin}_{price}"
+                    hl_trades[tid] = {
+                        'id': tid,
+                        'symbol': coin,
+                        'side': 'long' if is_long else 'short',
+                        'tradeType': 'open' if is_open else 'close',
+                        'price': price,
+                        'size': size,
+                        'pnl': pnl if pnl != 0.0 else None,
+                        'fee': fee,
+                        'ts': ts,
+                        'source': 'hl'
+                    }
+                log.info(f"HL fills: {len(hl_trades)}")
+
 
         # 2. Funding - use HypeDexer if available
         if HYPEDEXER_KEY:
