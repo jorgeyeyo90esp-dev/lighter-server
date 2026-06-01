@@ -1022,6 +1022,28 @@ async def h_hl_funding_test(req):
 
     return cors(web.json_response(results))
 
+async def h_hd_test(req):
+    wallet = HL_WALLET
+    api_key = os.environ.get('HYPEDEXER_KEY', '')
+    if not api_key:
+        return cors(web.json_response({'error': 'No HYPEDEXER_KEY env var'}))
+    results = {}
+    hdrs2 = {'X-API-Key': api_key}
+    async with ClientSession() as session:
+        for url in [
+            f'https://api.hypedexer.com/v1/fills?user={wallet}&limit=3',
+            f'https://api.hypedexer.com/v1/user/{wallet}/fills?limit=3',
+            f'https://api.hypedexer.com/v1/trades?user={wallet}&limit=3',
+        ]:
+            try:
+                async with session.get(url, headers=hdrs2) as r:
+                    body = await r.text()
+                    results[url] = {'status': r.status, 'body': body[:300]}
+            except Exception as e:
+                results[url] = {'error': str(e)}
+    return cors(web.json_response(results))
+
+
 async def h_hl_debug(req):
     wallet = HL_WALLET
     async with ClientSession() as session:
@@ -1211,6 +1233,7 @@ def create_app():
     app.router.add_post('/aster/upload_csv', h_aster_upload_csv)
     app.router.add_post('/aster/clear_csv', h_aster_clear_csv)
     app.router.add_get('/hl/debug', h_hl_debug)
+    app.router.add_get('/hd/test', h_hd_test)
     app.router.add_get('/hl/funding_test', h_hl_funding_test)
     app.router.add_get('/hl/ledger', h_hl_ledger_inspect)
     app.router.add_post('/hl/upload_funding', h_hl_upload_funding)
