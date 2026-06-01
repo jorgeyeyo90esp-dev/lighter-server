@@ -1027,21 +1027,20 @@ async def h_hd_test(req):
     api_key = os.environ.get('HYPEDEXER_KEY', '')
     if not api_key:
         return cors(web.json_response({'error': 'No HYPEDEXER_KEY env var'}))
-    results = {}
     hdrs2 = {'X-API-Key': api_key}
     async with ClientSession() as session:
-        for url in [
-            f'https://api.hypedexer.com/v1/fills?user={wallet}&limit=3',
-            f'https://api.hypedexer.com/v1/user/{wallet}/fills?limit=3',
-            f'https://api.hypedexer.com/v1/trades?user={wallet}&limit=3',
-        ]:
-            try:
-                async with session.get(url, headers=hdrs2) as r:
-                    body = await r.text()
-                    results[url] = {'status': r.status, 'body': body[:300]}
-            except Exception as e:
-                results[url] = {'error': str(e)}
-    return cors(web.json_response(results))
+        # Test single call with small limit
+        url = f'https://api.hypedexer.com/v1/fills?user={wallet}&limit=3'
+        try:
+            async with session.get(url, headers=hdrs2) as r:
+                body = await r.text()
+                try:
+                    data = await r.json(content_type=None)
+                except:
+                    data = body[:500]
+                return cors(web.json_response({'status': r.status, 'data': data, 'headers': dict(r.headers)}))
+        except Exception as e:
+            return cors(web.json_response({'error': str(e)}))
 
 
 async def h_hl_debug(req):
