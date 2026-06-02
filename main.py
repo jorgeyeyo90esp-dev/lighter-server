@@ -112,7 +112,7 @@ async def load_all_funding(session, account, start_ts=None):
     total = 0
     while True:
         url = (f"{BASE}/api/v1/positionFunding"
-               f"?account_index={account}&market_id=255&limit=100"
+               f"?account_index={account}&limit=100"
                f"&start_timestamp={start}&end_timestamp={now_ms}")
         if cursor:
             url += f"&cursor={cursor}"
