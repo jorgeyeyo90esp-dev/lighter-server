@@ -374,8 +374,16 @@ async def h_summary(req):
         elif t['pnl'] < 0: m['losses'] += 1
         if m['best'] is None or t['pnl'] > m['best']: m['best'] = t['pnl']
         if m['worst'] is None or t['pnl'] < m['worst']: m['worst'] = t['pnl']
+    # Add funding per symbol
+    for f in funding.values():
+        s = f.get('symbol', '?')
+        if s not in by_sym:
+            by_sym[s] = {'symbol': s, 'trades': 0, 'pnl': 0.0, 'wins': 0, 'losses': 0, 'best': None, 'worst': None}
+        by_sym[s]['funding'] = round(by_sym[s].get('funding', 0) + f.get('payment', 0), 4)
     for s in by_sym:
         by_sym[s]['pnl'] = round(by_sym[s]['pnl'], 4)
+        by_sym[s]['funding'] = round(by_sym[s].get('funding', 0), 4)
+        by_sym[s]['total_pnl'] = round(by_sym[s]['pnl'] + by_sym[s].get('funding', 0), 4)
         if by_sym[s]['best']: by_sym[s]['best'] = round(by_sym[s]['best'], 4)
         if by_sym[s]['worst']: by_sym[s]['worst'] = round(by_sym[s]['worst'], 4)
     return cors(web.json_response({
