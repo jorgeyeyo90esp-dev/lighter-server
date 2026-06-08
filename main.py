@@ -176,7 +176,8 @@ async def historical_load(session, account):
 async def incremental_update(session, account):
     global last_incremental
     now_ms = int(time.time() * 1000)
-    ts = today_start_ms()
+    # Go back 7 days to catch any missed trades
+    ts = now_ms - (7 * 24 * 60 * 60 * 1000)
     log.info("Incremental update...")
     text = await export_call(session, account, ts, now_ms, 'trade')
     if text:
