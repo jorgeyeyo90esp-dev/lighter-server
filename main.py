@@ -75,7 +75,8 @@ def parse_trade_csv(text):
             price = float(row.get('Price', 0) or 0)
             size = float(row.get('Size', 0) or 0)
             fee = float(row.get('Fee', 0) or 0)
-            tid = f"{date_str}_{market}_{side_raw}_{price}_{size}".replace(' ', '_')
+            tv = row.get('Trade Value', '')
+            tid = f"{date_str}_{market}_{side_raw}_{price}_{size}_{tv}".replace(' ', '_')
             result[tid] = {
                 'id': tid, 'symbol': market,
                 'side': 'long' if is_long else 'short',
@@ -112,7 +113,7 @@ async def load_all_funding(session, account, start_ts=None):
     total = 0
     while True:
         url = (f"{BASE}/api/v1/positionFunding"
-               f"?account_index={account}&market_id=255&limit=100"
+               f"?account_index={account}&limit=100"
                f"&start_timestamp={start}&end_timestamp={now_ms}")
         if cursor:
             url += f"&cursor={cursor}"
