@@ -156,9 +156,7 @@ async def historical_load(session, account):
     chunks = []
     while cur < now:
         nxt = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
-        # Add 2 day overlap to catch trades near month boundaries
-        end_with_overlap = min(nxt + timedelta(days=2), now)
-        chunks.append((to_ms(cur), to_ms(end_with_overlap)))
+        chunks.append((to_ms(cur), to_ms(min(nxt, now))))
         cur = nxt
     log.info(f"Loading {len(chunks)} monthly chunks")
     for i, (s, e) in enumerate(chunks):
@@ -178,8 +176,10 @@ async def historical_load(session, account):
 async def incremental_update(session, account):
     global last_incremental
     now_ms = int(time.time() * 1000)
-    # Go back 30 days to catch any missed trades
-    ts = now_ms - (30 * 24 * 60 * 60 * 1000)
+    # Go back to start of previous month to catch any gaps
+    now_dt = datetime.now(timezone.utc)
+    prev_month = (now_dt.replace(day=1) - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    ts = to_ms(prev_month)
     log.info("Incremental update...")
     text = await export_call(session, account, ts, now_ms, 'trade')
     if text:
