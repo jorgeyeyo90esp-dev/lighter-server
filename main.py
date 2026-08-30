@@ -156,7 +156,9 @@ async def historical_load(session, account):
     chunks = []
     while cur < now:
         nxt = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
-        chunks.append((to_ms(cur), to_ms(min(nxt, now))))
+        # Add 2 day overlap to catch trades near month boundaries
+        end_with_overlap = min(nxt + timedelta(days=2), now)
+        chunks.append((to_ms(cur), to_ms(end_with_overlap)))
         cur = nxt
     log.info(f"Loading {len(chunks)} monthly chunks")
     for i, (s, e) in enumerate(chunks):
@@ -176,10 +178,8 @@ async def historical_load(session, account):
 async def incremental_update(session, account):
     global last_incremental
     now_ms = int(time.time() * 1000)
-    # Go back to start of previous month to catch any gaps
-    now_dt = datetime.now(timezone.utc)
-    prev_month = (now_dt.replace(day=1) - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    ts = to_ms(prev_month)
+    # Go back 30 days to catch any missed trades
+    ts = now_ms - (30 * 24 * 60 * 60 * 1000)
     log.info("Incremental update...")
     text = await export_call(session, account, ts, now_ms, 'trade')
     if text:
@@ -354,6 +354,46 @@ async def h_funding(req):
 async def h_positions(req):
     return cors(web.json_response({'positions': list(positions.values())}))
 
+async def h_bx_summary(req):
+    closes = [t for t in bx_trades.values() if t.get('tradeType')=='close' and t.get('pnl') is not None]
+    pnls = [t['pnl'] for t in closes]
+    total_pnl = round(sum(pnls), 4)
+    wins = sum(1 for p in pnls if p > 0)
+    losses = sum(1 for p in pnls if p < 0)
+    wr = round(wins/len(pnls)*100, 1) if pnls else 0
+    now = int(time.time()*1000)
+    today_start = today_start_ms()
+    today_pnl = round(sum(t['pnl'] for t in closes if int(t.get('ts',0))>=today_start), 4)
+    p7 = round(sum(t['pnl'] for t in closes if int(t.get('ts',0))>=now-7*86400000), 4)
+    p30 = round(sum(t['pnl'] for t in closes if int(t.get('ts',0))>=now-30*86400000), 4)
+    by_sym = {}
+    for t in closes:
+        s = t.get('symbol','?')
+        if s not in by_sym:
+            by_sym[s] = {'symbol':s,'trades':0,'pnl':0.0,'wins':0,'losses':0,'best':None,'worst':None}
+        m = by_sym[s]
+        m['trades']+=1; m['pnl']+=t['pnl']
+        if t['pnl']>0: m['wins']+=1
+        else: m['losses']+=1
+        if m['best'] is None or t['pnl']>m['best']: m['best']=t['pnl']
+        if m['worst'] is None or t['pnl']<m['worst']: m['worst']=t['pnl']
+    for s in by_sym:
+        by_sym[s]['pnl']=round(by_sym[s]['pnl'],4)
+    return cors(web.json_response({
+        'total_pnl': total_pnl, 'today_pnl': today_pnl,
+        'p7': p7, 'p30': p30,
+        'total_trades': len(bx_trades), 'closed_trades': len(closes),
+        'wins': wins, 'losses': losses, 'win_rate': wr,
+        'account_balance': bx_account_balance,
+        'by_symbol': list(by_sym.values()),
+        'initial_load_done': bx_initial_load_done
+    }))
+
+async def h_bx_trades(req):
+    limit = int(req.rel_url.query.get('limit', 20000))
+    all_t = sorted(bx_trades.values(), key=lambda t: int(t.get('ts',0) or 0), reverse=True)
+    return cors(web.json_response({'trades': all_t[:limit], 'total': len(all_t), 'loading': not bx_initial_load_done}))
+
 async def h_summary(req):
     ts = today_start_ms()
     closes = [t for t in trades.values() if t.get('tradeType') == 'close' and t.get('pnl') is not None]
@@ -405,6 +445,8 @@ async def h_options(req):
 
 async def on_start(app):
     app['task'] = asyncio.ensure_future(ws_listener())
+    if BX_API_KEY:
+        app['bx_task'] = asyncio.ensure_future(bx_main_loop())
 
 async def on_stop(app):
     app['task'].cancel()
@@ -419,6 +461,8 @@ def create_app():
     app.router.add_get('/funding', h_funding)
     app.router.add_get('/positions', h_positions)
     app.router.add_get('/summary', h_summary)
+    app.router.add_get('/bx/summary', h_bx_summary)
+    app.router.add_get('/bx/trades', h_bx_trades)
     app.router.add_options('/{p:.*}', h_options)
     app.on_startup.append(on_start)
     app.on_cleanup.append(on_stop)
