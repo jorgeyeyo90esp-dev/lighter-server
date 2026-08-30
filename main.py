@@ -26,6 +26,126 @@ BASE = 'https://mainnet.zklighter.elliot.ai'
 BASE_WS = 'wss://mainnet.zklighter.elliot.ai/stream'
 GENESIS_MS = 1737072000000
 
+# ── Bitunix ──
+import hashlib, uuid as _uuid
+BX_BASE = 'https://fapi.bitunix.com'
+BX_API_KEY = os.environ.get('BX_API_KEY', '')
+BX_SECRET_KEY = os.environ.get('BX_SECRET_KEY', '')
+bx_trades = {}
+bx_funding = {}
+bx_account_balance = None
+bx_initial_load_done = False
+
+def bx_sign(query_params='', body=''):
+    nonce = _uuid.uuid4().hex[:32]
+    timestamp = str(int(time.time() * 1000))
+    digest_input = nonce + timestamp + BX_API_KEY + query_params + body
+    digest = hashlib.sha256(digest_input.encode()).hexdigest()
+    sign = hashlib.sha256((digest + BX_SECRET_KEY).encode()).hexdigest()
+    return {'api-key': BX_API_KEY, 'nonce': nonce, 'timestamp': timestamp, 'sign': sign, 'Content-Type': 'application/json'}
+
+async def bx_get(session, path, params=None):
+    if not BX_API_KEY or not BX_SECRET_KEY:
+        return None
+    query_str = ''
+    url = BX_BASE + path
+    if params:
+        sorted_params = sorted(params.items())
+        query_str = ''.join(f"{k}{v}" for k,v in sorted_params)
+        url += '?' + '&'.join(f"{k}={v}" for k,v in sorted_params)
+    try:
+        async with session.get(url, headers=bx_sign(query_str)) as r:
+            if r.status == 200:
+                data = await r.json()
+                if data.get('code') == 0:
+                    return data.get('data')
+                else:
+                    log.error(f"Bitunix {path}: {data.get('msg')}")
+                    return None
+            else:
+                body = await r.text()
+                log.error(f"Bitunix {path} HTTP {r.status}: {body[:150]}")
+                return None
+    except Exception as e:
+        log.error(f"Bitunix {path}: {e}")
+        return None
+
+async def load_bx_account(session):
+    global bx_account_balance
+    data = await bx_get(session, '/api/v1/futures/account/get_single_account', {'coin': 'USDT'})
+    if data:
+        bx_account_balance = float(data.get('available', 0) or 0) + float(data.get('frozen', 0) or 0)
+        log.info(f"Bitunix balance: {bx_account_balance}")
+
+async def load_bx_trades_all(session):
+    global bx_trades
+    skip = 0
+    limit = 100
+    while True:
+        data = await bx_get(session, '/api/v1/futures/trade/get_history_trades', {'skip': str(skip), 'limit': str(limit)})
+        await asyncio.sleep(0.2)
+        if not data:
+            break
+        trade_list = data.get('tradeList', [])
+        if not trade_list:
+            break
+        for t in trade_list:
+            tid = f"bx_{t.get('tradeId', '')}"
+            pnl_raw = t.get('realizedPNL', '0')
+            pnl = float(pnl_raw) if pnl_raw and pnl_raw != '' else None
+            reduce_only = t.get('reduceOnly', False)
+            trade_type = 'close' if reduce_only else 'open'
+            bx_trades[tid] = {
+                'id': tid,
+                'symbol': t.get('symbol', '?').replace('USDT', ''),
+                'side': 'long' if t.get('side') == 'BUY' else 'short',
+                'tradeType': trade_type,
+                'price': float(t.get('price', 0) or 0),
+                'size': float(t.get('qty', 0) or 0),
+                'pnl': pnl if trade_type == 'close' else None,
+                'fee': float(t.get('fee', 0) or 0),
+                'ts': int(t.get('ctime', 0)),
+                'source': 'bx'
+            }
+        log.info(f"Bitunix trades loaded: {len(bx_trades)} (skip={skip})")
+        if len(trade_list) < limit:
+            break
+        skip += limit
+
+async def bx_main_loop():
+    global bx_initial_load_done
+    if not BX_API_KEY:
+        return
+    log.info("Loading Bitunix data...")
+    async with ClientSession() as session:
+        await load_bx_account(session)
+        await load_bx_trades_all(session)
+        bx_initial_load_done = True
+        log.info(f"Bitunix DONE: {len(bx_trades)} trades")
+    while True:
+        await asyncio.sleep(900)
+        async with ClientSession() as session:
+            await load_bx_account(session)
+            data = await bx_get(session, '/api/v1/futures/trade/get_history_trades', {'skip': '0', 'limit': '100'})
+            if data:
+                for t in (data.get('tradeList') or []):
+                    tid = f"bx_{t.get('tradeId', '')}"
+                    if tid not in bx_trades:
+                        pnl_raw = t.get('realizedPNL', '0')
+                        pnl = float(pnl_raw) if pnl_raw else None
+                        reduce_only = t.get('reduceOnly', False)
+                        trade_type = 'close' if reduce_only else 'open'
+                        bx_trades[tid] = {
+                            'id': tid, 'symbol': t.get('symbol','?').replace('USDT',''),
+                            'side': 'long' if t.get('side')=='BUY' else 'short',
+                            'tradeType': trade_type,
+                            'price': float(t.get('price',0) or 0),
+                            'size': float(t.get('qty',0) or 0),
+                            'pnl': pnl if trade_type=='close' else None,
+                            'fee': float(t.get('fee',0) or 0),
+                            'ts': int(t.get('ctime',0)), 'source': 'bx'
+                        }
+
 def get_account():
     try: return TOKEN.split(':')[1]
     except: return None
