@@ -26,126 +26,6 @@ BASE = 'https://mainnet.zklighter.elliot.ai'
 BASE_WS = 'wss://mainnet.zklighter.elliot.ai/stream'
 GENESIS_MS = 1737072000000
 
-# ── Bitunix ──
-import hashlib, uuid as _uuid
-BX_BASE = 'https://fapi.bitunix.com'
-BX_API_KEY = os.environ.get('BX_API_KEY', '')
-BX_SECRET_KEY = os.environ.get('BX_SECRET_KEY', '')
-bx_trades = {}
-bx_funding = {}
-bx_account_balance = None
-bx_initial_load_done = False
-
-def bx_sign(query_params='', body=''):
-    nonce = _uuid.uuid4().hex[:32]
-    timestamp = str(int(time.time() * 1000))
-    digest_input = nonce + timestamp + BX_API_KEY + query_params + body
-    digest = hashlib.sha256(digest_input.encode()).hexdigest()
-    sign = hashlib.sha256((digest + BX_SECRET_KEY).encode()).hexdigest()
-    return {'api-key': BX_API_KEY, 'nonce': nonce, 'timestamp': timestamp, 'sign': sign, 'Content-Type': 'application/json'}
-
-async def bx_get(session, path, params=None):
-    if not BX_API_KEY or not BX_SECRET_KEY:
-        return None
-    query_str = ''
-    url = BX_BASE + path
-    if params:
-        sorted_params = sorted(params.items())
-        query_str = ''.join(f"{k}{v}" for k,v in sorted_params)
-        url += '?' + '&'.join(f"{k}={v}" for k,v in sorted_params)
-    try:
-        async with session.get(url, headers=bx_sign(query_str)) as r:
-            if r.status == 200:
-                data = await r.json()
-                if data.get('code') == 0:
-                    return data.get('data')
-                else:
-                    log.error(f"Bitunix {path}: {data.get('msg')}")
-                    return None
-            else:
-                body = await r.text()
-                log.error(f"Bitunix {path} HTTP {r.status}: {body[:150]}")
-                return None
-    except Exception as e:
-        log.error(f"Bitunix {path}: {e}")
-        return None
-
-async def load_bx_account(session):
-    global bx_account_balance
-    data = await bx_get(session, '/api/v1/futures/account/get_single_account', {'coin': 'USDT'})
-    if data:
-        bx_account_balance = float(data.get('available', 0) or 0) + float(data.get('frozen', 0) or 0)
-        log.info(f"Bitunix balance: {bx_account_balance}")
-
-async def load_bx_trades_all(session):
-    global bx_trades
-    skip = 0
-    limit = 100
-    while True:
-        data = await bx_get(session, '/api/v1/futures/trade/get_history_trades', {'skip': str(skip), 'limit': str(limit)})
-        await asyncio.sleep(0.2)
-        if not data:
-            break
-        trade_list = data.get('tradeList', [])
-        if not trade_list:
-            break
-        for t in trade_list:
-            tid = f"bx_{t.get('tradeId', '')}"
-            pnl_raw = t.get('realizedPNL', '0')
-            pnl = float(pnl_raw) if pnl_raw and pnl_raw != '' else None
-            reduce_only = t.get('reduceOnly', False)
-            trade_type = 'close' if reduce_only else 'open'
-            bx_trades[tid] = {
-                'id': tid,
-                'symbol': t.get('symbol', '?').replace('USDT', ''),
-                'side': 'long' if t.get('side') == 'BUY' else 'short',
-                'tradeType': trade_type,
-                'price': float(t.get('price', 0) or 0),
-                'size': float(t.get('qty', 0) or 0),
-                'pnl': pnl if trade_type == 'close' else None,
-                'fee': float(t.get('fee', 0) or 0),
-                'ts': int(t.get('ctime', 0)),
-                'source': 'bx'
-            }
-        log.info(f"Bitunix trades loaded: {len(bx_trades)} (skip={skip})")
-        if len(trade_list) < limit:
-            break
-        skip += limit
-
-async def bx_main_loop():
-    global bx_initial_load_done
-    if not BX_API_KEY:
-        return
-    log.info("Loading Bitunix data...")
-    async with ClientSession() as session:
-        await load_bx_account(session)
-        await load_bx_trades_all(session)
-        bx_initial_load_done = True
-        log.info(f"Bitunix DONE: {len(bx_trades)} trades")
-    while True:
-        await asyncio.sleep(900)
-        async with ClientSession() as session:
-            await load_bx_account(session)
-            data = await bx_get(session, '/api/v1/futures/trade/get_history_trades', {'skip': '0', 'limit': '100'})
-            if data:
-                for t in (data.get('tradeList') or []):
-                    tid = f"bx_{t.get('tradeId', '')}"
-                    if tid not in bx_trades:
-                        pnl_raw = t.get('realizedPNL', '0')
-                        pnl = float(pnl_raw) if pnl_raw else None
-                        reduce_only = t.get('reduceOnly', False)
-                        trade_type = 'close' if reduce_only else 'open'
-                        bx_trades[tid] = {
-                            'id': tid, 'symbol': t.get('symbol','?').replace('USDT',''),
-                            'side': 'long' if t.get('side')=='BUY' else 'short',
-                            'tradeType': trade_type,
-                            'price': float(t.get('price',0) or 0),
-                            'size': float(t.get('qty',0) or 0),
-                            'pnl': pnl if trade_type=='close' else None,
-                            'fee': float(t.get('fee',0) or 0),
-                            'ts': int(t.get('ctime',0)), 'source': 'bx'
-                        }
-
 def get_account():
     try: return TOKEN.split(':')[1]
     except: return None
@@ -232,7 +112,7 @@ async def load_all_funding(session, account, start_ts=None):
     total = 0
     while True:
         url = (f"{BASE}/api/v1/positionFunding"
-               f"?account_index={account}&limit=100"
+               f"?account_index={account}&market_id=255&limit=100"
                f"&start_timestamp={start}&end_timestamp={now_ms}")
         if cursor:
             url += f"&cursor={cursor}"
@@ -276,9 +156,7 @@ async def historical_load(session, account):
     chunks = []
     while cur < now:
         nxt = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
-        # Add 2 day overlap to catch trades near month boundaries
-        end_with_overlap = min(nxt + timedelta(days=2), now)
-        chunks.append((to_ms(cur), to_ms(end_with_overlap)))
+        chunks.append((to_ms(cur), to_ms(min(nxt, now))))
         cur = nxt
     log.info(f"Loading {len(chunks)} monthly chunks")
     for i, (s, e) in enumerate(chunks):
@@ -298,8 +176,9 @@ async def historical_load(session, account):
 async def incremental_update(session, account):
     global last_incremental
     now_ms = int(time.time() * 1000)
-    # Go back 30 days to catch any missed trades
-    ts = now_ms - (30 * 24 * 60 * 60 * 1000)
+    now_dt = datetime.now(timezone.utc)
+    prev_month = (now_dt.replace(day=1) - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    ts = to_ms(prev_month)
     log.info("Incremental update...")
     text = await export_call(session, account, ts, now_ms, 'trade')
     if text:
@@ -474,46 +353,6 @@ async def h_funding(req):
 async def h_positions(req):
     return cors(web.json_response({'positions': list(positions.values())}))
 
-async def h_bx_summary(req):
-    closes = [t for t in bx_trades.values() if t.get('tradeType')=='close' and t.get('pnl') is not None]
-    pnls = [t['pnl'] for t in closes]
-    total_pnl = round(sum(pnls), 4)
-    wins = sum(1 for p in pnls if p > 0)
-    losses = sum(1 for p in pnls if p < 0)
-    wr = round(wins/len(pnls)*100, 1) if pnls else 0
-    now = int(time.time()*1000)
-    today_start = today_start_ms()
-    today_pnl = round(sum(t['pnl'] for t in closes if int(t.get('ts',0))>=today_start), 4)
-    p7 = round(sum(t['pnl'] for t in closes if int(t.get('ts',0))>=now-7*86400000), 4)
-    p30 = round(sum(t['pnl'] for t in closes if int(t.get('ts',0))>=now-30*86400000), 4)
-    by_sym = {}
-    for t in closes:
-        s = t.get('symbol','?')
-        if s not in by_sym:
-            by_sym[s] = {'symbol':s,'trades':0,'pnl':0.0,'wins':0,'losses':0,'best':None,'worst':None}
-        m = by_sym[s]
-        m['trades']+=1; m['pnl']+=t['pnl']
-        if t['pnl']>0: m['wins']+=1
-        else: m['losses']+=1
-        if m['best'] is None or t['pnl']>m['best']: m['best']=t['pnl']
-        if m['worst'] is None or t['pnl']<m['worst']: m['worst']=t['pnl']
-    for s in by_sym:
-        by_sym[s]['pnl']=round(by_sym[s]['pnl'],4)
-    return cors(web.json_response({
-        'total_pnl': total_pnl, 'today_pnl': today_pnl,
-        'p7': p7, 'p30': p30,
-        'total_trades': len(bx_trades), 'closed_trades': len(closes),
-        'wins': wins, 'losses': losses, 'win_rate': wr,
-        'account_balance': bx_account_balance,
-        'by_symbol': list(by_sym.values()),
-        'initial_load_done': bx_initial_load_done
-    }))
-
-async def h_bx_trades(req):
-    limit = int(req.rel_url.query.get('limit', 20000))
-    all_t = sorted(bx_trades.values(), key=lambda t: int(t.get('ts',0) or 0), reverse=True)
-    return cors(web.json_response({'trades': all_t[:limit], 'total': len(all_t), 'loading': not bx_initial_load_done}))
-
 async def h_summary(req):
     ts = today_start_ms()
     closes = [t for t in trades.values() if t.get('tradeType') == 'close' and t.get('pnl') is not None]
@@ -565,8 +404,6 @@ async def h_options(req):
 
 async def on_start(app):
     app['task'] = asyncio.ensure_future(ws_listener())
-    if BX_API_KEY:
-        app['bx_task'] = asyncio.ensure_future(bx_main_loop())
 
 async def on_stop(app):
     app['task'].cancel()
@@ -581,8 +418,6 @@ def create_app():
     app.router.add_get('/funding', h_funding)
     app.router.add_get('/positions', h_positions)
     app.router.add_get('/summary', h_summary)
-    app.router.add_get('/bx/summary', h_bx_summary)
-    app.router.add_get('/bx/trades', h_bx_trades)
     app.router.add_options('/{p:.*}', h_options)
     app.on_startup.append(on_start)
     app.on_cleanup.append(on_stop)
