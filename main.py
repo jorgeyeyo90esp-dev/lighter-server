@@ -383,7 +383,9 @@ async def historical_load2(session, account):
     global initial_load_done2, account_balance2
     log.info("=== HISTORICAL LOAD2 START ===")
     now = datetime.now(timezone.utc)
-    genesis = from_ms(GENESIS_MS).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    # Use May 2026 as genesis for account2 (newer account)
+    GENESIS2_MS = 1746057600000  # 2026-05-01
+    genesis = from_ms(GENESIS2_MS).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     chunks = []
     cur = genesis
     while cur < now:
@@ -393,13 +395,15 @@ async def historical_load2(session, account):
     log.info(f"Account2: Loading {len(chunks)} weekly chunks")
     for i, (s, e) in enumerate(chunks):
         label = from_ms(s).strftime('%Y-%m-%d')
-        url = f"{BASE}/api/v1/export?account_index={account}&type=trade&start_timestamp={s}&end_timestamp={e}"
         try:
+            url = f"{BASE}/api/v1/export?account_index={account}&type=trade&start_timestamp={s}&end_timestamp={e}"
             async with session.get(url, headers=hdrs2()) as r:
                 if r.status == 200:
                     data = await r.json()
                     data_url = data.get('data_url') or data.get('url')
-                    if data_url:
+                    if not data_url:
+                        log.debug(f"Account2 chunk {label}: no data_url")
+                    else:
                         async with session.get(data_url) as r2:
                             if r2.status == 200:
                                 text = await r2.text()
@@ -407,10 +411,14 @@ async def historical_load2(session, account):
                                 before = len(trades2)
                                 trades2.update(chunk)
                                 added = len(trades2) - before
-                                if added > 0:
-                                    log.info(f"Account2 chunk {i+1}/{len(chunks)} {label}: +{added} trades")
+                                log.info(f"Account2 chunk {i+1}/{len(chunks)} {label}: +{added} (total {len(trades2)})")
+                            else:
+                                log.error(f"Account2 chunk {label}: S3 HTTP {r2.status}")
+                else:
+                    body = await r.text()
+                    log.error(f"Account2 chunk {label}: HTTP {r.status} {body[:100]}")
         except Exception as e:
-            log.debug(f"Account2 chunk {label}: {e}")
+            log.error(f"Account2 chunk {label}: {e}")
         await asyncio.sleep(0.2)
     # Load funding for account2
     try:
