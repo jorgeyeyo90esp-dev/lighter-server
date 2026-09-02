@@ -332,13 +332,9 @@ async def h_status(req):
 async def h_trades(req):
     limit = int(req.rel_url.query.get('limit', 20000))
     sym_f = req.rel_url.query.get('symbol', '').lower()
-    today_only = req.rel_url.query.get('today', '').lower() == 'true'
     all_t = sorted(trades.values(), key=lambda t: int(t.get('ts', 0) or 0), reverse=True)
     if sym_f:
         all_t = [t for t in all_t if sym_f in (t.get('symbol') or '').lower()]
-    if today_only:
-        ts = today_start_ms()
-        all_t = [t for t in all_t if int(t.get('ts', 0) or 0) >= ts]
     return cors(web.json_response({
         'trades': all_t[:limit],
         'total': len(all_t),
