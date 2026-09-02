@@ -17,21 +17,11 @@ positions = {}
 market_map = {}
 connected = False
 last_update = 0
-
-# Account 2 state
-trades2 = {}
-funding2 = {}
-positions2 = {}
-connected2 = False
-last_update2 = 0
-initial_load_done2 = False
-account_balance2 = None
 account_balance = {'value': None, 'field': ''}
 initial_load_done = False
 last_incremental = 0
 
 TOKEN = os.environ.get('LIGHTER_TOKEN', '')
-TOKEN2 = os.environ.get('LIGHTER_TOKEN_2', '')
 BASE = 'https://mainnet.zklighter.elliot.ai'
 BASE_WS = 'wss://mainnet.zklighter.elliot.ai/stream'
 GENESIS_MS = 1737072000000
@@ -39,13 +29,6 @@ GENESIS_MS = 1737072000000
 def get_account():
     try: return TOKEN.split(':')[1]
     except: return None
-
-def get_account2():
-    try: return TOKEN2.split(':')[1]
-    except: return None
-
-def hdrs2():
-    return {'Authorization': TOKEN2}
 
 def hdrs():
     return {'Authorization': TOKEN}
@@ -169,30 +152,21 @@ async def historical_load(session, account):
     log.info("=== HISTORICAL LOAD START ===")
     now = datetime.now(timezone.utc)
     genesis = from_ms(GENESIS_MS).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-    # Build weekly chunks for robustness - smaller ranges = more reliable exports
-    chunks = []
     cur = genesis
+    chunks = []
     while cur < now:
-        nxt = cur + timedelta(days=7)
+        nxt = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
         chunks.append((to_ms(cur), to_ms(min(nxt, now))))
         cur = nxt
-
-    log.info(f"Loading {len(chunks)} weekly chunks")
+    log.info(f"Loading {len(chunks)} monthly chunks")
     for i, (s, e) in enumerate(chunks):
-        label = from_ms(s).strftime('%Y-%m-%d')
+        label = from_ms(s).strftime('%Y-%m')
         text = await export_call(session, account, s, e, 'trade')
         if text:
             chunk = parse_trade_csv(text)
-            before = len(trades)
             trades.update(chunk)
-            added = len(trades) - before
-            if added > 0:
-                log.info(f"Chunk {i+1}/{len(chunks)} {label}: +{added} trades (total {len(trades)})")
-        else:
-            log.debug(f"Chunk {i+1}/{len(chunks)} {label}: no data")
-        await asyncio.sleep(0.2)
-
+            log.info(f"Chunk {i+1}/{len(chunks)} {label}: +{len(chunk)} trades (total {len(trades)})")
+        await asyncio.sleep(0.3)
     await load_all_funding(session, account)
     wp = sum(1 for t in trades.values() if t.get('pnl') is not None)
     ft = round(sum(f['payment'] for f in funding.values()), 4)
@@ -202,9 +176,8 @@ async def historical_load(session, account):
 async def incremental_update(session, account):
     global last_incremental
     now_ms = int(time.time() * 1000)
-    now_dt = datetime.now(timezone.utc)
-    prev_month = (now_dt.replace(day=1) - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    ts = to_ms(prev_month)
+    # Go back 7 days to catch any missed trades
+    ts = now_ms - (7 * 24 * 60 * 60 * 1000)
     log.info("Incremental update...")
     text = await export_call(session, account, ts, now_ms, 'trade')
     if text:
@@ -359,9 +332,13 @@ async def h_status(req):
 async def h_trades(req):
     limit = int(req.rel_url.query.get('limit', 20000))
     sym_f = req.rel_url.query.get('symbol', '').lower()
+    today_only = req.rel_url.query.get('today', '').lower() == 'true'
     all_t = sorted(trades.values(), key=lambda t: int(t.get('ts', 0) or 0), reverse=True)
     if sym_f:
         all_t = [t for t in all_t if sym_f in (t.get('symbol') or '').lower()]
+    if today_only:
+        ts = today_start_ms()
+        all_t = [t for t in all_t if int(t.get('ts', 0) or 0) >= ts]
     return cors(web.json_response({
         'trades': all_t[:limit],
         'total': len(all_t),
@@ -378,166 +355,6 @@ async def h_funding(req):
 
 async def h_positions(req):
     return cors(web.json_response({'positions': list(positions.values())}))
-
-async def historical_load2(session, account):
-    global initial_load_done2, account_balance2
-    log.info("=== HISTORICAL LOAD2 START ===")
-    now = datetime.now(timezone.utc)
-    # Use September 2026 as genesis for account2
-    GENESIS2_MS = 1788220800000  # 2026-09-01
-    genesis = from_ms(GENESIS2_MS).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    chunks = []
-    cur = genesis
-    while cur < now:
-        nxt = cur + timedelta(days=7)
-        chunks.append((to_ms(cur), to_ms(min(nxt, now))))
-        cur = nxt
-    log.info(f"Account2: Loading {len(chunks)} weekly chunks")
-    for i, (s, e) in enumerate(chunks):
-        label = from_ms(s).strftime('%Y-%m-%d')
-        try:
-            url = f"{BASE}/api/v1/export?account_index={account}&type=trade&start_timestamp={s}&end_timestamp={e}"
-            async with session.get(url, headers=hdrs2()) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    data_url = data.get('data_url') or data.get('url')
-                    if not data_url:
-                        log.debug(f"Account2 chunk {label}: no data_url")
-                    else:
-                        async with session.get(data_url) as r2:
-                            if r2.status == 200:
-                                text = await r2.text()
-                                chunk = parse_trade_csv(text)
-                                before = len(trades2)
-                                trades2.update(chunk)
-                                added = len(trades2) - before
-                                log.info(f"Account2 chunk {i+1}/{len(chunks)} {label}: +{added} (total {len(trades2)})")
-                            else:
-                                log.error(f"Account2 chunk {label}: S3 HTTP {r2.status}")
-                else:
-                    body = await r.text()
-                    log.error(f"Account2 chunk {label}: HTTP {r.status} {body[:100]}")
-        except Exception as e:
-            log.error(f"Account2 chunk {label}: {e}")
-        await asyncio.sleep(0.2)
-    # Load funding for account2
-    try:
-        async with session.get(f"{BASE}/api/v1/account?by=index&value={account}", headers=hdrs2()) as r:
-            if r.status == 200:
-                data = await r.json()
-                acct = (data.get('account') or [{}])[0] if isinstance(data.get('account'), list) else data.get('account', {})
-                account_balance2 = float(acct.get('total_asset_value', 0) or 0)
-    except Exception as e:
-        log.debug(f"Account2 balance: {e}")
-    wp = sum(1 for t in trades2.values() if t.get('pnl') is not None)
-    log.info(f"=== ACCOUNT2 DONE: {len(trades2)} trades ({wp} with PnL) ===")
-    initial_load_done2 = True
-
-async def ws_listener2():
-    global connected2, last_update2
-    account = get_account2()
-    if not TOKEN2 or not account:
-        log.info("No LIGHTER_TOKEN_2 configured")
-        return
-    async with ClientSession() as session:
-        await historical_load2(session, account)
-        while True:
-            await asyncio.sleep(900)
-            # Incremental update for account2
-            now_ms = int(time.time() * 1000)
-            now_dt = datetime.now(timezone.utc)
-            prev_month = (now_dt.replace(day=1) - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            ts = to_ms(prev_month)
-            url = f"{BASE}/api/v1/export?account_index={account}&type=trade&start_timestamp={ts}&end_timestamp={now_ms}"
-            try:
-                async with session.get(url, headers=hdrs2()) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        data_url = data.get('data_url') or data.get('url')
-                        if data_url:
-                            async with session.get(data_url) as r2:
-                                if r2.status == 200:
-                                    text = await r2.text()
-                                    new = parse_trade_csv(text)
-                                    before = len(trades2)
-                                    trades2.update(new)
-                                    log.info(f"Account2 incremental: +{len(trades2)-before} new trades")
-            except Exception as e:
-                log.debug(f"Account2 incremental: {e}")
-
-async def h_debug2(req):
-    account = get_account2()
-    if not account:
-        return cors(web.json_response({'error': 'No TOKEN2'}))
-    async with ClientSession() as session:
-        # Test one week export
-        now_ms = int(time.time() * 1000)
-        week_ago = now_ms - 7 * 24 * 60 * 60 * 1000
-        url = f"{BASE}/api/v1/export?account_index={account}&type=trade&start_timestamp={week_ago}&end_timestamp={now_ms}"
-        try:
-            async with session.get(url, headers=hdrs2()) as r:
-                status = r.status
-                body = await r.text()
-                try:
-                    data = await r.json(content_type=None)
-                except:
-                    data = None
-                return cors(web.json_response({
-                    'account': account,
-                    'token_prefix': TOKEN2[:20] if TOKEN2 else 'none',
-                    'url': url,
-                    'status': status,
-                    'body': body[:400],
-                    'data_url': data.get('data_url') if data else None,
-                    'trades2_count': len(trades2),
-                    'initial_load_done2': initial_load_done2
-                }))
-        except Exception as e:
-            return cors(web.json_response({'error': str(e), 'account': account}))
-
-async def h_summary2(req):
-    ts = today_start_ms()
-    closes = [t for t in trades2.values() if t.get('tradeType') == 'close' and t.get('pnl') is not None]
-    pnls = [t['pnl'] for t in closes]
-    tp = round(sum(pnls), 4)
-    ft = round(sum(f['payment'] for f in funding2.values()), 4)
-    wins = sum(1 for p in pnls if p > 0)
-    losses = sum(1 for p in pnls if p < 0)
-    wr = round(wins / len(pnls) * 100, 1) if pnls else 0
-    today_c = [t for t in closes if int(t.get('ts', 0) or 0) >= ts]
-    today_pnl = round(sum(t['pnl'] for t in today_c), 4)
-    now = int(time.time() * 1000)
-    by_sym = {}
-    for t in closes:
-        s = t.get('symbol', '?')
-        if s not in by_sym:
-            by_sym[s] = {'symbol': s, 'trades': 0, 'pnl': 0.0, 'wins': 0, 'losses': 0, 'best': None, 'worst': None, 'funding': 0, 'total_pnl': 0}
-        m = by_sym[s]
-        m['trades'] += 1; m['pnl'] += t['pnl']
-        if t['pnl'] > 0: m['wins'] += 1
-        else: m['losses'] += 1
-        if m['best'] is None or t['pnl'] > m['best']: m['best'] = t['pnl']
-        if m['worst'] is None or t['pnl'] < m['worst']: m['worst'] = t['pnl']
-    for s in by_sym:
-        by_sym[s]['pnl'] = round(by_sym[s]['pnl'], 4)
-        by_sym[s]['total_pnl'] = round(by_sym[s]['pnl'], 4)
-    return cors(web.json_response({
-        'total_pnl': round(tp + ft, 4), 'trade_pnl': tp, 'funding_total': ft,
-        'today_pnl': today_pnl, 'total_trades': len(trades2), 'closed_trades': len(closes),
-        'today_trades': len(today_c), 'wins': wins, 'losses': losses, 'win_rate': wr,
-        'by_symbol': list(by_sym.values()), 'positions': list(positions2.values()),
-        'connected': connected2, 'initial_load_done': initial_load_done2,
-        'account_balance': account_balance2, 'last_update': last_update2
-    }))
-
-async def h_trades2(req):
-    limit = int(req.rel_url.query.get('limit', 20000))
-    all_t = sorted(trades2.values(), key=lambda t: int(t.get('ts', 0) or 0), reverse=True)
-    return cors(web.json_response({'trades': all_t[:limit], 'total': len(all_t), 'loading': not initial_load_done2}))
-
-async def h_funding2(req):
-    all_f = sorted(funding2.values(), key=lambda f: int(f.get('ts', 0) or 0), reverse=True)
-    return cors(web.json_response({'funding': all_f, 'total': round(sum(f['payment'] for f in funding2.values()), 4)}))
 
 async def h_summary(req):
     ts = today_start_ms()
@@ -590,8 +407,6 @@ async def h_options(req):
 
 async def on_start(app):
     app['task'] = asyncio.ensure_future(ws_listener())
-    if TOKEN2:
-        app['task2'] = asyncio.ensure_future(ws_listener2())
 
 async def on_stop(app):
     app['task'].cancel()
@@ -606,10 +421,6 @@ def create_app():
     app.router.add_get('/funding', h_funding)
     app.router.add_get('/positions', h_positions)
     app.router.add_get('/summary', h_summary)
-    app.router.add_get('/summary2', h_summary2)
-    app.router.add_get('/debug2', h_debug2)
-    app.router.add_get('/trades2', h_trades2)
-    app.router.add_get('/funding2', h_funding2)
     app.router.add_options('/{p:.*}', h_options)
     app.on_startup.append(on_start)
     app.on_cleanup.append(on_stop)
