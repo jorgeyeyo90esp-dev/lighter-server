@@ -457,6 +457,36 @@ async def ws_listener2():
             except Exception as e:
                 log.debug(f"Account2 incremental: {e}")
 
+async def h_debug2(req):
+    account = get_account2()
+    if not account:
+        return cors(web.json_response({'error': 'No TOKEN2'}))
+    async with ClientSession() as session:
+        # Test one week export
+        now_ms = int(time.time() * 1000)
+        week_ago = now_ms - 7 * 24 * 60 * 60 * 1000
+        url = f"{BASE}/api/v1/export?account_index={account}&type=trade&start_timestamp={week_ago}&end_timestamp={now_ms}"
+        try:
+            async with session.get(url, headers=hdrs2()) as r:
+                status = r.status
+                body = await r.text()
+                try:
+                    data = await r.json(content_type=None)
+                except:
+                    data = None
+                return cors(web.json_response({
+                    'account': account,
+                    'token_prefix': TOKEN2[:20] if TOKEN2 else 'none',
+                    'url': url,
+                    'status': status,
+                    'body': body[:400],
+                    'data_url': data.get('data_url') if data else None,
+                    'trades2_count': len(trades2),
+                    'initial_load_done2': initial_load_done2
+                }))
+        except Exception as e:
+            return cors(web.json_response({'error': str(e), 'account': account}))
+
 async def h_summary2(req):
     ts = today_start_ms()
     closes = [t for t in trades2.values() if t.get('tradeType') == 'close' and t.get('pnl') is not None]
@@ -569,6 +599,7 @@ def create_app():
     app.router.add_get('/positions', h_positions)
     app.router.add_get('/summary', h_summary)
     app.router.add_get('/summary2', h_summary2)
+    app.router.add_get('/debug2', h_debug2)
     app.router.add_get('/trades2', h_trades2)
     app.router.add_get('/funding2', h_funding2)
     app.router.add_options('/{p:.*}', h_options)
