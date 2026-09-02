@@ -383,8 +383,8 @@ async def historical_load2(session, account):
     global initial_load_done2, account_balance2
     log.info("=== HISTORICAL LOAD2 START ===")
     now = datetime.now(timezone.utc)
-    # Use May 2026 as genesis for account2 (newer account)
-    GENESIS2_MS = 1746057600000  # 2026-05-01
+    # Use September 2026 as genesis for account2
+    GENESIS2_MS = 1788220800000  # 2026-09-01
     genesis = from_ms(GENESIS2_MS).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     chunks = []
     cur = genesis
