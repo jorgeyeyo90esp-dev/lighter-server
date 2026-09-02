@@ -373,6 +373,46 @@ async def h_positions(req):
     return cors(web.json_response({'positions': list(positions.values())}))
 
 
+async def load_all_funding2(session, account, start_ts=None):
+    now_ms = int(time.time() * 1000)
+    start = start_ts or 1788220800000  # 2026-09-01
+    cursor = None
+    total = 0
+    while True:
+        url = (f"{BASE}/api/v1/positionFunding"
+               f"?account_index={account}&limit=100"
+               f"&start_timestamp={start}&end_timestamp={now_ms}")
+        if cursor:
+            url += f"&cursor={cursor}"
+        try:
+            async with session.get(url, headers=hdrs2()) as r:
+                if r.status != 200:
+                    break
+                data = await r.json()
+                items = data.get('position_fundings', [])
+                if not items:
+                    break
+                for item in items:
+                    fid = str(item.get('funding_id', ''))
+                    mid = str(item.get('market_id', ''))
+                    payment = float(item.get('change', 0))
+                    ts_val = item.get('timestamp', now_ms)
+                    if fid:
+                        funding2[fid] = {
+                            'id': fid, 'symbol': sym(mid),
+                            'payment': payment, 'ts': ts_val
+                        }
+                        total += 1
+                cursor = data.get('next_cursor')
+                if not cursor or len(items) < 100:
+                    break
+                await asyncio.sleep(0.2)
+        except Exception as e:
+            log.error(f"load_funding2: {e}")
+            break
+    ft = round(sum(f['payment'] for f in funding2.values()), 4) if funding2 else 0.0
+    log.info(f"Funding2: {total} payments, total={ft}")
+
 async def historical_load2(session, account):
     global initial_load_done2, account_balance2
     log.info("=== HISTORICAL LOAD2 START ===")
@@ -414,8 +454,10 @@ async def historical_load2(session, account):
                 acct = (data.get('account') or [{}])[0] if isinstance(data.get('account'), list) else data.get('account', {})
                 account_balance2 = float(acct.get('total_asset_value', 0) or 0)
     except: pass
+    await load_all_funding2(session, account)
     wp = sum(1 for t in trades2.values() if t.get('pnl') is not None)
-    log.info(f"=== ACCOUNT2 DONE: {len(trades2)} trades ({wp} with PnL) ===")
+    ft2 = round(sum(f['payment'] for f in funding2.values()), 4)
+    log.info(f"=== ACCOUNT2 DONE: {len(trades2)} trades ({wp} with PnL), {len(funding2)} funding, total={ft2} ===")
     initial_load_done2 = True
 
 async def ws_listener2():
@@ -446,6 +488,10 @@ async def ws_listener2():
                                     before = len(trades2)
                                     trades2.update(new)
                                     log.info(f"Account2 incremental: +{len(trades2)-before} new trades")
+                # Update funding2
+                now_dt2 = datetime.now(timezone.utc)
+                prev_m2 = (now_dt2.replace(day=1) - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                await load_all_funding2(session, account, start_ts=to_ms(prev_m2))
             except Exception as e:
                 log.error(f"Account2 incremental: {e}")
 
@@ -454,7 +500,7 @@ async def h_summary2(req):
     closes = [t for t in trades2.values() if t.get('tradeType') == 'close' and t.get('pnl') is not None]
     pnls = [t['pnl'] for t in closes]
     tp = round(sum(pnls), 4)
-    ft = round(sum(f['payment'] for f in funding2.values()), 4)
+    ft = round(sum(f['payment'] for f in funding2.values()), 4) if funding2 else 0.0
     wins = sum(1 for p in pnls if p > 0)
     losses = sum(1 for p in pnls if p < 0)
     wr = round(wins / len(pnls) * 100, 1) if pnls else 0
