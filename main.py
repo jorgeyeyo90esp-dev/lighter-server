@@ -176,8 +176,10 @@ async def historical_load(session, account):
 async def incremental_update(session, account):
     global last_incremental
     now_ms = int(time.time() * 1000)
-    # Go back 7 days to catch any missed trades
-    ts = now_ms - (7 * 24 * 60 * 60 * 1000)
+    # Go back to start of previous month to never miss trades
+    now_dt = datetime.now(timezone.utc)
+    prev_month = (now_dt.replace(day=1) - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    ts = to_ms(prev_month)
     log.info("Incremental update...")
     text = await export_call(session, account, ts, now_ms, 'trade')
     if text:
@@ -304,6 +306,7 @@ async def ws_listener():
             except Exception as e:
                 log.error(f"WS: {e}")
             connected = False
+            log.info("WS disconnected, reconnecting in 5s...")
             await asyncio.sleep(5)
 
 def cors(r):
@@ -408,6 +411,10 @@ async def on_stop(app):
     app['task'].cancel()
     try: await app['task']
     except asyncio.CancelledError: pass
+
+async def handle_exception(loop, context):
+    msg = context.get("exception", context["message"])
+    log.error(f"Unhandled async exception: {msg}")
 
 def create_app():
     app = web.Application()
