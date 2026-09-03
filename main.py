@@ -525,6 +525,7 @@ async def h_summary2(req):
         'total_pnl': round(tp + ft, 4), 'trade_pnl': tp, 'funding_total': ft,
         'today_pnl': today_pnl, 'total_trades': len(trades2), 'closed_trades': len(closes),
         'today_trades': len(today_c), 'wins': wins, 'losses': losses, 'win_rate': wr,
+        'fee_total': round(sum(float(t.get('fee') or 0) for t in trades2.values()), 4),
         'by_symbol': list(by_sym.values()), 'positions': list(positions2.values()),
         'connected': connected2, 'initial_load_done': initial_load_done2,
         'account_balance': account_balance2, 'last_update': last_update2
@@ -573,6 +574,7 @@ async def h_summary(req):
         'today_trade_pnl': today_pnl, 'today_funding': today_f,
         'total_trades': len(trades), 'closed_trades': len(closes),
         'today_trades': len(today_c), 'wins': wins, 'losses': losses, 'win_rate': wr,
+        'fee_total': round(sum(float(t.get('fee') or 0) for t in trades.values()), 4),
         'by_symbol': list(by_sym.values()),
         'positions': list(positions.values()),
         'connected': connected,
