@@ -191,12 +191,16 @@ async def run_account1():
                     now_ms=int(time.time()*1000);now_dt=datetime.now(timezone.utc)
                     prev_m=(now_dt.replace(day=1)-timedelta(days=1)).replace(day=1,hour=0,minute=0,second=0,microsecond=0)
                     ts=to_ms(prev_m)
-                    text=await export_call(session,account,ts,now_ms,hdrs())
-                    if text:
-                        new=parse_csv(text);before=len(trades);trades.update(new)
-                        log.info(f"Incremental A1: +{len(trades)-before} trades")
-                    await load_funding_data(session,account,funding,hdrs(),start_ts=ts)
-                except Exception as e: log.error(f"Incr A1: {e}")
+                    log.info(f"Incremental A1 running (from {prev_m.strftime('%Y-%m-%d')})...")
+                    async with ClientSession() as s2:
+                        text=await export_call(s2,account,ts,now_ms,hdrs())
+                        if text:
+                            new=parse_csv(text);before=len(trades);trades.update(new)
+                            log.info(f"Incremental A1: +{len(trades)-before} trades (total {len(trades)})")
+                        else:
+                            log.warning("Incremental A1: no data returned")
+                        await load_funding_data(s2,account,funding,hdrs(),start_ts=ts)
+                except Exception as e: log.error(f"Incr A1 error: {e}")
         asyncio.ensure_future(scheduler())
         while True:
             try:
@@ -222,12 +226,14 @@ async def run_account2():
                 now_ms=int(time.time()*1000);now_dt=datetime.now(timezone.utc)
                 prev_m=(now_dt.replace(day=1)-timedelta(days=1)).replace(day=1,hour=0,minute=0,second=0,microsecond=0)
                 ts=to_ms(prev_m)
-                text=await export_call(session,account,ts,now_ms,hdrs2())
-                if text:
-                    new=parse_csv(text);before=len(trades2);trades2.update(new)
-                    log.info(f"Incremental A2: +{len(trades2)-before} trades")
-                await load_funding_data(session,account,funding2,hdrs2(),start_ts=ts)
-            except Exception as e: log.error(f"Incr A2: {e}")
+                log.info("Incremental A2 running...")
+                async with ClientSession() as s2:
+                    text=await export_call(s2,account,ts,now_ms,hdrs2())
+                    if text:
+                        new=parse_csv(text);before=len(trades2);trades2.update(new)
+                        log.info(f"Incremental A2: +{len(trades2)-before} trades (total {len(trades2)})")
+                    await load_funding_data(s2,account,funding2,hdrs2(),start_ts=ts)
+            except Exception as e: log.error(f"Incr A2 error: {e}")
 
 async def on_start(app):
     app['t1']=asyncio.ensure_future(run_account1())
