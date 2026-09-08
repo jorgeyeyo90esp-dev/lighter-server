@@ -170,7 +170,33 @@ def build_summary(st,sf,sp,done):
 async def h_root(req):    return cors(web.json_response({'ok':True,'loading':not initial_load_done}))
 
 async def h_markets(req):
-    return cors(web.json_response({'market_map': market_map, 'total': len(market_map)}))
+    # Also try to fetch markets live to debug
+    async with ClientSession() as s:
+        try:
+            async with s.get(f"{BASE}/api/v1/orderBookDetails") as r:
+                status = r.status
+                if r.status == 200:
+                    data = await r.json()
+                    keys = list(data.keys())
+                    first_item = None
+                    for k in keys:
+                        v = data[k]
+                        if isinstance(v, list) and len(v) > 0:
+                            first_item = v[0]
+                            break
+                    return cors(web.json_response({
+                        'market_map': market_map,
+                        'total': len(market_map),
+                        'api_status': status,
+                        'response_keys': keys,
+                        'first_item_keys': list(first_item.keys()) if first_item else None,
+                        'first_item': first_item
+                    }))
+                else:
+                    body = await r.text()
+                    return cors(web.json_response({'error': f'HTTP {status}', 'body': body[:200]}))
+        except Exception as e:
+            return cors(web.json_response({'error': str(e), 'market_map': market_map}))
 
 async def h_test_export(req):
     account = get_account()
