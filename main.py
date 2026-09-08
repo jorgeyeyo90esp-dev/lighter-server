@@ -39,15 +39,26 @@ def cors(r):
     return r
 
 async def load_markets(session):
-    try:
-        async with session.get(f"{BASE}/api/v1/orderBookDetails") as r:
-            if r.status==200:
-                for m in ((await r.json()).get('order_books') or []):
-                    mid=str(m.get('market_id',''))
-                    base=(m.get('base_asset') or {}).get('symbol','')
-                    if base: market_map[mid]=base
-                log.info(f"Markets: {len(market_map)}")
-    except Exception as e: log.error(f"markets: {e}")
+    for attempt in range(3):
+        try:
+            async with session.get(f"{BASE}/api/v1/orderBookDetails", timeout=10) as r:
+                if r.status==200:
+                    data = await r.json()
+                    order_books = data.get('order_books') or []
+                    log.info(f"orderBookDetails returned {len(order_books)} markets")
+                    for m in order_books:
+                        mid=str(m.get('market_id',''))
+                        base=(m.get('base_asset') or {}).get('symbol','')
+                        if base: market_map[mid]=base
+                    log.info(f"Markets loaded: {len(market_map)} — {dict(list(market_map.items())[:5])}")
+                    return
+                else:
+                    body = await r.text()
+                    log.error(f"markets HTTP {r.status}: {body[:100]}")
+        except Exception as e:
+            log.error(f"markets attempt {attempt+1}: {e}")
+        await asyncio.sleep(2)
+    log.error("Failed to load markets after 3 attempts")
 
 def parse_csv(text):
     result={}
