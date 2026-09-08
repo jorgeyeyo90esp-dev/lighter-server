@@ -188,18 +188,29 @@ async def run_account1():
             while True:
                 await asyncio.sleep(900)
                 try:
-                    now_ms=int(time.time()*1000);now_dt=datetime.now(timezone.utc)
-                    prev_m=(now_dt.replace(day=1)-timedelta(days=1)).replace(day=1,hour=0,minute=0,second=0,microsecond=0)
-                    ts=to_ms(prev_m)
-                    log.info(f"Incremental A1 running (from {prev_m.strftime('%Y-%m-%d')})...")
+                    now_ms=int(time.time()*1000)
+                    now_dt=datetime.now(timezone.utc)
+                    # Use small 7-day chunks for last 30 days to avoid API limits
+                    end=now_dt
+                    start=end-timedelta(days=30)
+                    cur=start
+                    total_added=0
                     async with ClientSession() as s2:
-                        text=await export_call(s2,account,ts,now_ms,hdrs())
-                        if text:
-                            new=parse_csv(text);before=len(trades);trades.update(new)
-                            log.info(f"Incremental A1: +{len(trades)-before} trades (total {len(trades)})")
-                        else:
-                            log.warning("Incremental A1: no data returned")
-                        await load_funding_data(s2,account,funding,hdrs(),start_ts=ts)
+                        while cur<end:
+                            nxt=min(cur+timedelta(days=7),end)
+                            s_ms=to_ms(cur);e_ms=to_ms(nxt)
+                            text=await export_call(s2,account,s_ms,e_ms,hdrs())
+                            if text:
+                                new=parse_csv(text);before=len(trades);trades.update(new)
+                                added=len(trades)-before
+                                if added>0:
+                                    log.info(f"Incr A1 {cur.strftime('%Y-%m-%d')}: +{added} (total {len(trades)})")
+                                    total_added+=added
+                            cur=nxt
+                            await asyncio.sleep(0.2)
+                        if total_added==0:
+                            log.info("Incr A1: no new trades")
+                        await load_funding_data(s2,account,funding,hdrs(),start_ts=to_ms(start))
                 except Exception as e: log.error(f"Incr A1 error: {e}")
         asyncio.ensure_future(scheduler())
         while True:
