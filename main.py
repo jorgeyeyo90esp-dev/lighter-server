@@ -172,18 +172,23 @@ async def historical_load(session, account):
     cur = genesis
     chunks = []
     while cur < now:
-        nxt = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
+        nxt = cur + timedelta(days=7)
         chunks.append((to_ms(cur), to_ms(min(nxt, now))))
         cur = nxt
-    log.info(f"Loading {len(chunks)} monthly chunks")
+    log.info(f"Loading {len(chunks)} weekly chunks")
     for i, (s, e) in enumerate(chunks):
-        label = from_ms(s).strftime('%Y-%m')
+        label = from_ms(s).strftime('%Y-%m-%d')
         text = await export_call(session, account, s, e, 'trade')
         if text:
             chunk = parse_trade_csv(text)
+            before = len(trades)
             trades.update(chunk)
-            log.info(f"Chunk {i+1}/{len(chunks)} {label}: +{len(chunk)} trades (total {len(trades)})")
-        await asyncio.sleep(0.3)
+            added = len(trades) - before
+            if added > 0:
+                log.info(f"Chunk {i+1}/{len(chunks)} {label}: +{added} (total {len(trades)})")
+        else:
+            log.debug(f"Chunk {i+1}/{len(chunks)} {label}: no data")
+        await asyncio.sleep(0.2)
     await load_all_funding(session, account)
     wp = sum(1 for t in trades.values() if t.get('pnl') is not None)
     ft = round(sum(f['payment'] for f in funding.values()), 4)
