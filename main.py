@@ -156,32 +156,34 @@ async def h_root(req):    return cors(web.json_response({'ok':True,'loading':not
 async def h_test_export(req):
     account = get_account()
     if not account: return cors(web.json_response({'error':'no token'}))
-    # Test last 3 days
     now_ms = int(time.time()*1000)
-    day3_ago = now_ms - 3*86400*1000
-    day2_ago = now_ms - 2*86400*1000
-    day1_ago = now_ms - 86400*1000
+    day7_ago = now_ms - 7*86400*1000
     results = []
     async with ClientSession() as s:
-        for label, s_ms, e_ms in [
-            ('last 3 days', day3_ago, now_ms),
-            ('last 2 days', day2_ago, now_ms),
-            ('last 1 day', day1_ago, now_ms),
-        ]:
-            url = f"{BASE}/api/v1/export?account_index={account}&type=trade&start_timestamp={s_ms}&end_timestamp={e_ms}"
-            try:
-                async with s.get(url, headers=hdrs()) as r:
-                    status = r.status
-                    if status == 200:
-                        data = await r.json()
-                        du = data.get('data_url') or data.get('url')
-                        results.append({'range': label, 'status': status, 'has_data_url': bool(du)})
-                    else:
-                        body = await r.text()
-                        results.append({'range': label, 'status': status, 'body': body[:100]})
-            except Exception as e:
-                results.append({'range': label, 'error': str(e)})
-    return cors(web.json_response({'account': account, 'results': results}))
+        url = f"{BASE}/api/v1/export?account_index={account}&type=trade&start_timestamp={day7_ago}&end_timestamp={now_ms}"
+        try:
+            async with s.get(url, headers=hdrs()) as r:
+                data = await r.json()
+                du = data.get('data_url') or data.get('url')
+                if du:
+                    async with s.get(du) as r2:
+                        text = await r2.text()
+                        lines = text.strip().split('\n')
+                        # Parse first few rows
+                        rows = []
+                        for line in lines[1:6]:
+                            if line.strip():
+                                rows.append(line[:100])
+                        results = {
+                            'total_lines': len(lines),
+                            'header': lines[0] if lines else '',
+                            'sample_rows': rows,
+                            'has_close_trades': any('Close' in l or 'close' in l for l in lines[1:])
+                        }
+                    return cors(web.json_response(results))
+        except Exception as e:
+            return cors(web.json_response({'error': str(e)}))
+    return cors(web.json_response({'error': 'no data_url'}))
 async def h_summary(req): return cors(web.json_response(build_summary(trades,funding,positions,initial_load_done)))
 async def h_summary2(req):return cors(web.json_response(build_summary(trades2,funding2,positions2,initial_load_done2)))
 async def h_trades(req):
