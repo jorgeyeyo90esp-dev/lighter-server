@@ -153,6 +153,9 @@ def build_summary(st,sf,sp,done):
 
 async def h_root(req):    return cors(web.json_response({'ok':True,'loading':not initial_load_done}))
 
+async def h_markets(req):
+    return cors(web.json_response({'market_map': market_map, 'total': len(market_map)}))
+
 async def h_test_export(req):
     account = get_account()
     if not account: return cors(web.json_response({'error':'no token'}))
@@ -286,6 +289,7 @@ def create_app():
     app=web.Application()
     app.router.add_get('/',h_root)
     app.router.add_get('/test_export',h_test_export)
+    app.router.add_get('/markets',h_markets)
     app.router.add_get('/summary',h_summary)
     app.router.add_get('/summary2',h_summary2)
     app.router.add_get('/trades',h_trades)
