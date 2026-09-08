@@ -39,26 +39,31 @@ def cors(r):
     return r
 
 async def load_markets(session):
-    for attempt in range(3):
+    # Try multiple endpoints to get all market IDs including delisted ones
+    endpoints = [
+        f"{BASE}/api/v1/orderBookDetails",
+        f"{BASE}/api/v1/markets",
+    ]
+    for url in endpoints:
         try:
-            async with session.get(f"{BASE}/api/v1/orderBookDetails", timeout=10) as r:
-                if r.status==200:
+            async with session.get(url, timeout=10) as r:
+                if r.status == 200:
                     data = await r.json()
-                    order_books = data.get('order_books') or []
-                    log.info(f"orderBookDetails returned {len(order_books)} markets")
-                    for m in order_books:
-                        mid=str(m.get('market_id',''))
-                        base=(m.get('base_asset') or {}).get('symbol','')
-                        if base: market_map[mid]=base
-                    log.info(f"Markets loaded: {len(market_map)} — {dict(list(market_map.items())[:5])}")
-                    return
-                else:
-                    body = await r.text()
-                    log.error(f"markets HTTP {r.status}: {body[:100]}")
+                    # Handle different response formats
+                    books = (data.get('order_books') or data.get('markets') or
+                             data.get('market_list') or [])
+                    if isinstance(data, list):
+                        books = data
+                    for m in books:
+                        mid = str(m.get('market_id', '') or m.get('id', ''))
+                        base = ((m.get('base_asset') or {}).get('symbol', '') or
+                                m.get('base_symbol', '') or m.get('symbol', ''))
+                        if mid and base:
+                            market_map[mid] = base.replace('USDT','').replace('USD','')
+            await asyncio.sleep(0.2)
         except Exception as e:
-            log.error(f"markets attempt {attempt+1}: {e}")
-        await asyncio.sleep(2)
-    log.error("Failed to load markets after 3 attempts")
+            log.debug(f"markets endpoint {url}: {e}")
+    log.info(f"Markets loaded: {len(market_map)}")
 
 def parse_csv(text):
     result={}
