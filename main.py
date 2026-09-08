@@ -172,10 +172,10 @@ async def historical_load(session, account):
     cur = genesis
     chunks = []
     while cur < now:
-        nxt = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
+        nxt = cur + timedelta(days=7)
         chunks.append((to_ms(cur), to_ms(min(nxt, now))))
         cur = nxt
-    log.info(f"Loading {len(chunks)} monthly chunks")
+    log.info(f"Loading {len(chunks)} weekly chunks")
     for i, (s, e) in enumerate(chunks):
         label = from_ms(s).strftime('%Y-%m')
         text = await export_call(session, account, s, e, 'trade')
