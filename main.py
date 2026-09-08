@@ -239,8 +239,12 @@ async def h_funding2(req):
 async def h_movimientos(req):    return cors(web.json_response(movimientos_data))
 async def h_save_movimientos(req):
     global movimientos_data
-    try: movimientos_data=await req.json(); return cors(web.json_response({'ok':True}))
-    except Exception as e: return cors(web.json_response({'ok':False,'error':str(e)}))
+    try:
+        movimientos_data = await req.json()
+        _save_mov(movimientos_data)
+        return cors(web.json_response({'ok': True}))
+    except Exception as e:
+        return cors(web.json_response({'ok': False, 'error': str(e)}))
 async def h_options(req): return cors(web.Response(status=200))
 
 async def run_account1():
