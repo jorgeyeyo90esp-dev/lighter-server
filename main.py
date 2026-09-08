@@ -152,6 +152,36 @@ def build_summary(st,sf,sp,done):
             'positions':list(sp.values()),'initial_load_done':done,'last_update':now}
 
 async def h_root(req):    return cors(web.json_response({'ok':True,'loading':not initial_load_done}))
+
+async def h_test_export(req):
+    account = get_account()
+    if not account: return cors(web.json_response({'error':'no token'}))
+    # Test last 3 days
+    now_ms = int(time.time()*1000)
+    day3_ago = now_ms - 3*86400*1000
+    day2_ago = now_ms - 2*86400*1000
+    day1_ago = now_ms - 86400*1000
+    results = []
+    async with ClientSession() as s:
+        for label, s_ms, e_ms in [
+            ('last 3 days', day3_ago, now_ms),
+            ('last 2 days', day2_ago, now_ms),
+            ('last 1 day', day1_ago, now_ms),
+        ]:
+            url = f"{BASE}/api/v1/export?account_index={account}&type=trade&start_timestamp={s_ms}&end_timestamp={e_ms}"
+            try:
+                async with s.get(url, headers=hdrs()) as r:
+                    status = r.status
+                    if status == 200:
+                        data = await r.json()
+                        du = data.get('data_url') or data.get('url')
+                        results.append({'range': label, 'status': status, 'has_data_url': bool(du)})
+                    else:
+                        body = await r.text()
+                        results.append({'range': label, 'status': status, 'body': body[:100]})
+            except Exception as e:
+                results.append({'range': label, 'error': str(e)})
+    return cors(web.json_response({'account': account, 'results': results}))
 async def h_summary(req): return cors(web.json_response(build_summary(trades,funding,positions,initial_load_done)))
 async def h_summary2(req):return cors(web.json_response(build_summary(trades2,funding2,positions2,initial_load_done2)))
 async def h_trades(req):
@@ -253,6 +283,7 @@ async def on_start(app):
 def create_app():
     app=web.Application()
     app.router.add_get('/',h_root)
+    app.router.add_get('/test_export',h_test_export)
     app.router.add_get('/summary',h_summary)
     app.router.add_get('/summary2',h_summary2)
     app.router.add_get('/trades',h_trades)
