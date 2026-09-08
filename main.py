@@ -39,31 +39,22 @@ def cors(r):
     return r
 
 async def load_markets(session):
-    # Try multiple endpoints to get all market IDs including delisted ones
-    endpoints = [
-        f"{BASE}/api/v1/orderBookDetails",
-        f"{BASE}/api/v1/markets",
-    ]
-    for url in endpoints:
-        try:
-            async with session.get(url, timeout=10) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    # Handle different response formats
-                    books = (data.get('order_books') or data.get('markets') or
-                             data.get('market_list') or [])
-                    if isinstance(data, list):
-                        books = data
-                    for m in books:
-                        mid = str(m.get('market_id', '') or m.get('id', ''))
-                        base = ((m.get('base_asset') or {}).get('symbol', '') or
-                                m.get('base_symbol', '') or m.get('symbol', ''))
-                        if mid and base:
-                            market_map[mid] = base.replace('USDT','').replace('USD','')
-            await asyncio.sleep(0.2)
-        except Exception as e:
-            log.debug(f"markets endpoint {url}: {e}")
-    log.info(f"Markets loaded: {len(market_map)}")
+    try:
+        async with session.get(f"{BASE}/api/v1/orderBookDetails", timeout=10) as r:
+            if r.status == 200:
+                data = await r.json()
+                # Response uses 'order_book_details' key, each item has 'symbol' and 'market_id'
+                books = data.get('order_book_details') or data.get('spot_order_book_details') or []
+                for m in books:
+                    mid = str(m.get('market_id', ''))
+                    sym = m.get('symbol', '')
+                    if mid and sym:
+                        market_map[mid] = sym
+                log.info(f"Markets loaded: {len(market_map)}")
+            else:
+                log.error(f"markets HTTP {r.status}")
+    except Exception as e:
+        log.error(f"load_markets: {e}")
 
 def parse_csv(text):
     result={}
