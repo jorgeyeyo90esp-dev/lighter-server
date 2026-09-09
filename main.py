@@ -9,6 +9,13 @@ TOKEN  = os.environ.get('LIGHTER_TOKEN', '')
 TOKEN2 = os.environ.get('LIGHTER_TOKEN_2', '')
 BASE   = 'https://mainnet.zklighter.elliot.ai'
 BASE_WS= 'wss://mainnet.zklighter.elliot.ai/stream'
+
+# ── Hyperliquid ──
+HL_BASE = 'https://api.hyperliquid.xyz'
+HL_WALLET = os.environ.get('HL_WALLET', '')
+hl_trades = {}
+hl_funding = {}
+hl_initial_load_done = False
 GENESIS_MS  = 1737072000000
 GENESIS2_MS = 1788220800000
 
@@ -157,6 +164,114 @@ def build_summary(st,sf,sp,done):
             'today_pnl':today_pnl,'p7':p7,'p30':p30,'total_trades':len(st),'closed_trades':len(closes),
             'wins':wins,'losses':losses,'win_rate':wr,'by_symbol':list(by_sym.values()),
             'positions':list(sp.values()),'initial_load_done':done,'last_update':now}
+
+async def hl_post(session, payload):
+    try:
+        async with session.post(f"{HL_BASE}/info",
+                                json=payload,
+                                headers={'Content-Type': 'application/json'},
+                                timeout=30) as r:
+            if r.status == 200:
+                return await r.json()
+            log.error(f"HL API {r.status}: {await r.text()[:100]}")
+    except Exception as e:
+        log.error(f"HL API: {e}")
+    return None
+
+async def load_hl_fills(session, wallet, genesis_ms=None):
+    start = genesis_ms or 1609459200000  # 2021-01-01
+    now_ms = int(time.time() * 1000)
+    total = 0
+    while start < now_ms:
+        end = min(start + 90 * 86400000, now_ms)  # 90-day chunks
+        data = await hl_post(session, {
+            "type": "userFillsByTime",
+            "user": wallet,
+            "startTime": start,
+            "endTime": end,
+            "aggregateByTime": False
+        })
+        if data and isinstance(data, list):
+            for f in data:
+                tid = str(f.get('tid', '')) or str(f.get('oid', '')) + str(f.get('time', ''))
+                coin = f.get('coin', '?')
+                side = f.get('side', '')
+                dir_ = f.get('dir', '')
+                pnl_r = f.get('closedPnl', '0')
+                fee_r = f.get('fee', '0')
+                pnl = float(pnl_r) if pnl_r else 0.0
+                fee = float(fee_r) if fee_r else 0.0
+                ts = int(f.get('time', 0))
+                is_close = 'Close' in dir_ or 'close' in dir_
+                hl_trades[tid] = {
+                    'id': tid, 'symbol': coin,
+                    'side': 'long' if side == 'B' else 'short',
+                    'tradeType': 'close' if is_close else 'open',
+                    'price': float(f.get('px', 0) or 0),
+                    'size': float(f.get('sz', 0) or 0),
+                    'pnl': pnl if is_close else None,
+                    'fee': fee, 'ts': ts
+                }
+                total += 1
+            if len(data) < 2000:
+                start = end
+            else:
+                # More data, advance to last timestamp
+                start = max(f.get('time', end) for f in data)
+        else:
+            start = end
+        await asyncio.sleep(0.3)
+    log.info(f"HL fills loaded: {total}")
+
+async def load_hl_funding(session, wallet):
+    data = await hl_post(session, {
+        "type": "userFunding",
+        "user": wallet,
+        "startTime": 1609459200000
+    })
+    if data and isinstance(data, list):
+        for f in data:
+            fid = str(f.get('hash', '')) + str(f.get('time', ''))
+            delta = f.get('delta', {})
+            pay = float(delta.get('fundingRate', 0) or 0) * float(delta.get('szi', 0) or 0)
+            coin = delta.get('coin', '?')
+            ts = int(f.get('time', 0))
+            hl_funding[fid] = {'id': fid, 'symbol': coin, 'payment': pay, 'ts': ts}
+        log.info(f"HL funding loaded: {len(hl_funding)}")
+
+async def run_hl():
+    global hl_initial_load_done
+    if not HL_WALLET:
+        log.info("No HL_WALLET configured")
+        return
+    log.info(f"Loading Hyperliquid data for {HL_WALLET[:10]}...")
+    async with ClientSession() as session:
+        await load_hl_fills(session, HL_WALLET)
+        await load_hl_funding(session, HL_WALLET)
+        hl_initial_load_done = True
+        wp = sum(1 for t in hl_trades.values() if t.get('pnl') is not None)
+        log.info(f"=== HL DONE: {len(hl_trades)} trades ({wp} with PnL) ===")
+        while True:
+            await asyncio.sleep(900)
+            try:
+                now_ms = int(time.time() * 1000)
+                week_ago = now_ms - 7 * 86400000
+                async with ClientSession() as s2:
+                    await load_hl_fills(s2, HL_WALLET, genesis_ms=week_ago)
+            except Exception as e:
+                log.error(f"HL incremental: {e}")
+
+async def h_hl_summary(req):
+    return cors(web.json_response(build_summary(hl_trades, hl_funding, {}, hl_initial_load_done)))
+
+async def h_hl_trades(req):
+    limit = int(req.rel_url.query.get('limit', 50000))
+    all_t = sorted(hl_trades.values(), key=lambda t: int(t.get('ts', 0) or 0), reverse=True)
+    return cors(web.json_response({'trades': all_t[:limit], 'total': len(all_t), 'loading': not hl_initial_load_done}))
+
+async def h_hl_funding(req):
+    all_f = sorted(hl_funding.values(), key=lambda f: int(f.get('ts', 0) or 0), reverse=True)
+    return cors(web.json_response({'funding': all_f, 'total': round(sum(f['payment'] for f in hl_funding.values()), 4)}))
 
 async def h_root(req):    return cors(web.json_response({'ok':True,'loading':not initial_load_done}))
 
@@ -321,6 +436,7 @@ async def run_account2():
 async def on_start(app):
     app['t1']=asyncio.ensure_future(run_account1())
     if TOKEN2: app['t2']=asyncio.ensure_future(run_account2())
+    if HL_WALLET: app['thl']=asyncio.ensure_future(run_hl())
 
 def create_app():
     app=web.Application()
@@ -334,6 +450,9 @@ def create_app():
     app.router.add_get('/funding',h_funding)
     app.router.add_get('/funding2',h_funding2)
     app.router.add_get('/movimientos',h_movimientos)
+    app.router.add_get('/hl/summary',h_hl_summary)
+    app.router.add_get('/hl/trades',h_hl_trades)
+    app.router.add_get('/hl/funding',h_hl_funding)
     app.router.add_post('/movimientos',h_save_movimientos)
     app.router.add_route('OPTIONS','/{path_info:.*}',h_options)
     app.on_startup.append(on_start)
